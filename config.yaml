@@ -1,0 +1,61 @@
+# ============================================================
+#  Конфиг радара. Все пороги — здесь, в коде их править не надо.
+#  Ключи берутся из переменных окружения (см. .env.example)
+# ============================================================
+
+rpc:
+  helius_api_key: "${HELIUS_API_KEY}"
+  rpc_url: "https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}"
+
+telegram:
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_id: "${TELEGRAM_CHAT_ID}"
+
+analyzer:
+  max_tx_pages: 12          # 12 * 100 = до 1200 свопов на кошелёк
+  page_limit: 100
+  sol_usd_fallback: 150     # для пересчёта USDC-сделок в SOL
+  dust_ratio: 0.02          # <2% остатка токена = позиция считается закрытой
+  concurrency: 4
+
+  # --- фильтр «годный кошелёк» ---
+  min_closed_trades: 30     # меньше 30 сделок = статистика ни о чём
+  min_expectancy_sol: 0.05  # средний профит на сделку, SOL
+  min_profit_factor: 1.3    # сумма профитов / сумма убытков
+  min_win_rate: 0.30
+  max_win_rate: 0.85        # ВЫШЕ 0.85 — почти всегда бот/фарм статистики, отсекаем
+  min_median_buy_sol: 0.3   # медианный размер входа
+  max_trades_per_day: 60    # выше — HFT-бот, копировать нереально
+  min_median_hold_sec: 120  # быстрее 2 минут — снайпер-бот, не повторишь руками
+  min_history_days: 21
+  max_open_loss_share: 0.5  # доля незакрытых позиций (мешки) от всех сделок
+
+radar:
+  poll_interval_sec: 20
+  confluence_wallets: 2         # сколько РАЗНЫХ годных кошельков должны купить
+  confluence_window_min: 30     # в пределах какого окна
+  min_combined_buy_sol: 3.0     # суммарный объём их покупок
+  max_token_age_min: 4320       # не старше 3 суток
+  cooldown_min: 180             # не сигналить один и тот же токен чаще
+  exit_on_wallet_sell_pct: 50   # если tracked-кошельки скинули >50% — сигнал на выход
+
+safety:
+  min_liquidity_usd: 15000
+  max_fdv_usd: 5000000
+  max_top10_pct: 35             # концентрация топ-10 холдеров
+  require_mint_authority_revoked: true
+  require_freeze_authority_revoked: true
+  max_rugcheck_score: 2000      # чем ниже, тем безопаснее (rugcheck.xyz)
+  min_buys_sells_ratio: 1.0
+
+risk:
+  stop_loss_pct: 25
+  take_profit_ladder_pct: [40, 100, 300]   # частичные выходы
+  risk_per_trade_pct: 1.0                  # % депозита на риск в сделке
+  account_size_sol: 10
+
+  # --- «не присылать сигнал, если winrate ниже цели» ---
+  target_hit_rate: 0.80        # твои 80%. Читай README: почему это почти = тишина
+  min_sample_for_gate: 25      # до 25 закрытых сигналов гейт не судит, а калибруется
+  gate_mode: "shadow"          # shadow = писать в лог но присылать с пометкой
+                               # hard   = молчать, пока замеренный winrate < target
