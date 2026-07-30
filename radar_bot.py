@@ -21,17 +21,33 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
+import logging
 import time
-from collections import defaultdict, deque
+from collections import deque
 
 import aiohttp
 
 import token_safety as ts
 from signal_journal import SignalJournal
-from wallet_analyzer import fetch_swaps, get_json, load_config, post_json
+from wallet_analyzer import (fetch_swaps, get_json, load_config, post_json,
+                             require_config, setup_logging)
 
 TG = "https://api.telegram.org/bot{token}/{method}"
+TG_LIMIT = 4096          # жёсткий лимит длины сообщения в Telegram
+
+log = logging.getLogger("radar")
+
+
+def esc(value) -> str:
+    """Экранируем всё, что пришло извне.
+
+    Символ токена берётся из Dexscreener, то есть его пишет автор монеты.
+    Тикер вида `<b>` ломал разбор parse_mode=HTML, Telegram отвечал 400,
+    и сигнал молча терялся.
+    """
+    return html.escape(str(value), quote=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -42,17 +58,42 @@ class Telegram:
         self.s, self.token, self.chat_id = session, token, chat_id
         self.offset = 0
 
+    @staticmethod
+    def _chunks(text: str) -> list[str]:
+        """Режем по строкам, чтобы не рвать HTML-теги посреди сообщения."""
+        if len(text) <= TG_LIMIT:
+            return [text]
+        out, cur = [], ""
+        for line in text.split("\n"):
+            line = line[:TG_LIMIT]
+            if len(cur) + len(line) + 1 > TG_LIMIT:
+                out.append(cur)
+                cur = line
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        if cur:
+            out.append(cur)
+        return out
+
     async def send(self, text: str, chat_id: str | None = None) -> None:
-        await post_json(self.s, TG.format(token=self.token, method="sendMessage"),
-                        {"chat_id": chat_id or self.chat_id, "text": text,
-                         "parse_mode": "HTML", "disable_web_page_preview": True})
+        for part in self._chunks(text):
+            res = await post_json(
+                self.s, TG.format(token=self.token, method="sendMessage"),
+                {"chat_id": chat_id or self.chat_id, "text": part,
+                 "parse_mode": "HTML", "disable_web_page_preview": True})
+            if res is None:
+                log.warning("Telegram не принял сообщение (%d символов)", len(part))
 
     async def poll(self) -> list[dict]:
         data = await get_json(self.s, TG.format(token=self.token, method="getUpdates"),
                               {"offset": self.offset, "timeout": 0}, retries=1)
-        updates = (data or {}).get("result") or []
+        updates = (data or {}).get("result") if isinstance(data, dict) else None
+        updates = [u for u in (updates or []) if isinstance(u, dict)]
         for u in updates:
-            self.offset = max(self.offset, u["update_id"] + 1)
+            try:
+                self.offset = max(self.offset, int(u["update_id"]) + 1)
+            except (KeyError, TypeError, ValueError):
+                continue
         return updates
 
 
@@ -64,24 +105,45 @@ class Radar:
         self.cfg = cfg
         self.wallets = wallets
         self.j = journal
-        # mint -> deque[(ts, wallet, sol)]
-        self.buys: dict[str, deque] = defaultdict(deque)
+        # mint -> deque[(ts, wallet, sol)]. Обычный dict, а не defaultdict:
+        # чтение конфлюэнса не должно само плодить пустые ключи.
+        self.buys: dict[str, deque] = {}
         self.started = int(time.time())
         self.checked = 0
 
     # ---------------------------------------------------------------- #
+    def _prune(self, mint: str) -> deque:
+        """Оставляем только покупки внутри окна конфлюэнса.
+
+        Фильтруем всю очередь, а не срезаем голову: кошельки опрашиваются
+        по очереди, поэтому свопы попадают сюда не в хронологическом порядке
+        и старые записи прятались за более свежими — окно «протекало»,
+        а конфлюэнс считался по покупкам многочасовой давности.
+        """
+        dq = self.buys.get(mint)
+        if dq is None:
+            return deque()
+        cutoff = int(time.time()) - self.cfg["radar"]["confluence_window_min"] * 60
+        fresh = [item for item in dq if item[0] >= cutoff]
+        if not fresh:
+            self.buys.pop(mint, None)      # иначе словарь растёт бесконечно
+            return deque()
+        dq.clear()
+        dq.extend(fresh)
+        return dq
+
+    def sweep(self) -> None:
+        """Периодическая уборка: минты, по которым давно не было покупок."""
+        for mint in list(self.buys):
+            self._prune(mint)
+
     def _remember_buy(self, mint: str, wallet: str, sol: float, when: int) -> None:
-        window = self.cfg["radar"]["confluence_window_min"] * 60
-        dq = self.buys[mint]
-        dq.append((when, wallet, sol))
-        cutoff = int(time.time()) - window
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
+        self.buys.setdefault(mint, deque()).append((when, wallet, sol))
+        self._prune(mint)
 
     def _confluence(self, mint: str) -> tuple[int, float, list[str]]:
-        dq = self.buys[mint]
         uniq: dict[str, float] = {}
-        for _, w, sol in dq:
+        for _, w, sol in self._prune(mint):
             uniq[w] = uniq.get(w, 0.0) + sol
         return len(uniq), sum(uniq.values()), list(uniq)
 
@@ -92,16 +154,23 @@ class Radar:
         fresh_window = int(time.time()) - r["confluence_window_min"] * 60
 
         for w in self.wallets:
-            swaps = await fetch_swaps(session, w, self.cfg, pages=1,
-                                      until_ts=fresh_window)
-            for s in swaps:
-                if s.ts < fresh_window or self.j.already_seen(s.sig):
-                    continue
-                if s.side == "buy":
-                    self._remember_buy(s.mint, w, s.quote_sol, s.ts)
-                    await self.maybe_signal(session, tg, s.mint)
-                else:
-                    await self.notify_wallet_exit(tg, s.mint, w)
+            try:
+                swaps = await fetch_swaps(session, w, self.cfg, pages=1,
+                                          until_ts=fresh_window)
+                for s in swaps:
+                    if s.ts < fresh_window or self.j.already_seen(s.sig):
+                        continue
+                    if s.side == "buy":
+                        self._remember_buy(s.mint, w, s.quote_sol, s.ts)
+                        await self.maybe_signal(session, tg, s.mint)
+                    else:
+                        await self.notify_wallet_exit(tg, s.mint, w)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                              # noqa: BLE001
+                # один нерабочий кошелёк не должен обрывать весь проход
+                log.warning("Кошелёк %s пропущен: %s: %s", w[:8], type(e).__name__, e)
+                log.debug("traceback", exc_info=True)
             await asyncio.sleep(0.15)  # щадим rate limit
 
     # ---------------------------------------------------------------- #
@@ -114,14 +183,21 @@ class Radar:
         if self.j.is_on_cooldown(mint, r["cooldown_min"]):
             return
 
+        stop_pct = float(rk["stop_loss_pct"])
+        ladder = [float(p) for p in rk["take_profit_ladder_pct"]]
+        if not 0 < stop_pct < 100 or not ladder:
+            log.error("risk.stop_loss_pct должен быть в (0, 100), "
+                      "take_profit_ladder_pct — непустым. Сигнал пропущен.")
+            return
+
         self.checked += 1
         safety = await ts.check_token(session, mint, self.cfg)
         if not safety.ok or safety.price_usd <= 0:
             return  # молча: скам-токены в чат не идут
 
         entry = safety.price_usd
-        sl = entry * (1 - rk["stop_loss_pct"] / 100)
-        tps = [entry * (1 + p / 100) for p in rk["take_profit_ladder_pct"]]
+        sl = entry * (1 - stop_pct / 100)
+        tps = sorted(entry * (1 + p / 100) for p in ladder)
 
         bucket = self.j.make_bucket(n, safety.liquidity_usd, safety.age_min)
         allowed, gate_note = self.j.gate(bucket, rk["target_hit_rate"],
@@ -139,23 +215,23 @@ class Radar:
             return  # hard-режим: тишина, но сделка пишется в журнал для замера
 
         risk_sol = rk["account_size_sol"] * rk["risk_per_trade_pct"] / 100
-        pos_sol = round(risk_sol / (rk["stop_loss_pct"] / 100), 3)
+        pos_sol = round(risk_sol / (stop_pct / 100), 3)
 
         msg = (
-            f"🟢 <b>ВХОД #{sid} · {safety.symbol}</b>\n"
-            f"<code>{mint}</code>\n\n"
+            f"🟢 <b>ВХОД #{sid} · {esc(safety.symbol)}</b>\n"
+            f"<code>{esc(mint)}</code>\n\n"
             f"Купили <b>{n}</b> отслеживаемых кошелька на <b>{total_sol:.2f} SOL</b>\n"
             f"Цена: <b>${entry:.8f}</b>\n"
             f"Ликвидность: ${safety.liquidity_usd:,.0f} · FDV ${safety.fdv_usd:,.0f}\n"
             f"Возраст: {safety.age_min:.0f} мин · топ-10: {safety.top10_pct}%\n"
             f"Rugcheck: {safety.rugcheck_score if safety.rugcheck_score is not None else '—'}\n\n"
-            f"🛑 Стоп: <b>${sl:.8f}</b> (−{rk['stop_loss_pct']}%)\n"
-            f"🎯 Тейки: " + " / ".join(f"${p:.8f}" for p in tps) + "\n"
-            f"   (+" + "% / +".join(str(p) for p in rk["take_profit_ladder_pct"]) + "%)\n"
+            f"🛑 Стоп: <b>${sl:.8f}</b> (−{stop_pct:g}%)\n"
+            "🎯 Тейки: " + " / ".join(f"${p:.8f}" for p in tps) + "\n"
+            "   (" + " / ".join(f"+{p:g}%" for p in sorted(ladder)) + ")\n"
             f"💰 Размер позиции: ~{pos_sol} SOL "
             f"(риск {rk['risk_per_trade_pct']}% от {rk['account_size_sol']} SOL)\n\n"
-            f"📊 {gate_note}\n"
-            f"<a href='{safety.pair_url}'>график</a>"
+            f"📊 {esc(gate_note)}\n"
+            f"<a href='{esc(safety.pair_url)}'>график</a>"
         )
         if not allowed:
             msg = "⚠️ <i>ниже целевого winrate, shadow-режим</i>\n\n" + msg
@@ -166,8 +242,8 @@ class Radar:
         for sig in self.j.list_open():
             if sig.mint == mint and sig.delivered:
                 await tg.send(
-                    f"🟡 <b>#{sig.id} {sig.symbol}</b>: отслеживаемый кошелёк "
-                    f"<code>{wallet[:6]}..{wallet[-4:]}</code> начал продавать.\n"
+                    f"🟡 <b>#{sig.id} {esc(sig.symbol)}</b>: отслеживаемый кошелёк "
+                    f"<code>{esc(wallet[:6])}..{esc(wallet[-4:])}</code> начал продавать.\n"
                     f"Умные деньги выходят — обычно это сигнал сокращать позицию.")
                 return
 
@@ -175,64 +251,82 @@ class Radar:
     async def monitor_open(self, session, tg: Telegram) -> None:
         """Ведём открытые сигналы: тейки, стоп, протухание."""
         for sig in self.j.list_open():
-            price = await ts.price_usd(session, sig.mint)
-            if price <= 0:
-                # ликвидность исчезла = раг
-                self.j.resolve(sig.id, "loss", 0.0)
-                if sig.delivered:
-                    await tg.send(f"💀 <b>#{sig.id} {sig.symbol}</b>: ликвидность "
-                                  f"пропала (rug). Сигнал закрыт как убыточный.")
-                continue
-
-            self.j.update_peak(sig.id, price)
-            chg = (price / sig.entry_price - 1) * 100
-
-            if price <= sig.sl_price:
-                self.j.resolve(sig.id, "loss", price)
-                if sig.delivered:
-                    await tg.send(f"🔴 <b>СТОП #{sig.id} {sig.symbol}</b>\n"
-                                  f"${price:.8f} ({chg:+.1f}%) — выходим, "
-                                  f"не усредняемся.")
-                continue
-
-            if price >= sig.tp_prices[0]:
-                # первый тейк = сигнал считается отработавшим в плюс
-                self.j.resolve(sig.id, "win", price)
-                if sig.delivered:
-                    hit = max(i + 1 for i, p in enumerate(sig.tp_prices) if price >= p)
-                    await tg.send(
-                        f"✅ <b>ТЕЙК {hit} #{sig.id} {sig.symbol}</b>\n"
-                        f"${price:.8f} ({chg:+.1f}%)\n"
-                        f"Фиксируй часть, стоп переставь в безубыток.")
-                continue
-
-            age_h = (time.time() - sig.ts) / 3600
-            if age_h > 24:
-                self.j.resolve(sig.id, "win" if chg > 0 else "loss", price)
-                if sig.delivered:
-                    await tg.send(f"⏳ <b>#{sig.id} {sig.symbol}</b>: 24 ч без "
-                                  f"движения к цели ({chg:+.1f}%). Закрываю по времени.")
+            await self._track(session, tg, sig)
+            # пауза вынесена из тела: раньше она стояла после серии continue
+            # и при закрытии нескольких сигналов подряд не срабатывала вовсе
             await asyncio.sleep(0.2)
+
+    async def _track(self, session, tg: Telegram, sig) -> None:
+        name = esc(sig.symbol)
+        price = await ts.price_usd(session, sig.mint)
+        if price <= 0:
+            # ликвидность исчезла = раг
+            self.j.resolve(sig.id, "loss", 0.0)
+            if sig.delivered:
+                await tg.send(f"💀 <b>#{sig.id} {name}</b>: ликвидность "
+                              f"пропала (rug). Сигнал закрыт как убыточный.")
+            return
+
+        self.j.update_peak(sig.id, price)
+        if sig.entry_price <= 0:                       # битая строка в старой БД
+            log.warning("Сигнал #%s без цены входа — закрываю.", sig.id)
+            self.j.resolve(sig.id, "loss", price)
+            return
+        chg = (price / sig.entry_price - 1) * 100
+
+        if price <= sig.sl_price:
+            self.j.resolve(sig.id, "loss", price)
+            if sig.delivered:
+                await tg.send(f"🔴 <b>СТОП #{sig.id} {name}</b>\n"
+                              f"${price:.8f} ({chg:+.1f}%) — выходим, "
+                              f"не усредняемся.")
+            return
+
+        # tp_prices пуст, если в конфиге пустая лестница или строка битая:
+        # раньше здесь был IndexError, ронявший весь цикл мониторинга
+        if sig.tp_prices and price >= sig.tp_prices[0]:
+            # первый тейк = сигнал считается отработавшим в плюс
+            self.j.resolve(sig.id, "win", price)
+            if sig.delivered:
+                hit = sum(1 for p in sig.tp_prices if price >= p)
+                await tg.send(
+                    f"✅ <b>ТЕЙК {hit} #{sig.id} {name}</b>\n"
+                    f"${price:.8f} ({chg:+.1f}%)\n"
+                    f"Фиксируй часть, стоп переставь в безубыток.")
+            return
+
+        max_age_h = self.cfg["radar"]["max_signal_age_h"]
+        if (time.time() - sig.ts) / 3600 > max_age_h:
+            self.j.resolve(sig.id, "win" if chg > 0 else "loss", price)
+            if sig.delivered:
+                await tg.send(f"⏳ <b>#{sig.id} {name}</b>: {max_age_h:g} ч без "
+                              f"движения к цели ({chg:+.1f}%). Закрываю по времени.")
 
     # ---------------------------------------------------------------- #
     async def handle_commands(self, tg: Telegram) -> None:
         for u in await tg.poll():
-            msg = u.get("message") or {}
+            msg = u.get("message") or u.get("channel_post") or {}
             text = (msg.get("text") or "").strip().lower()
             chat = str((msg.get("chat") or {}).get("id") or "")
             if not text.startswith("/"):
                 continue
+            # Имя бота публично, и написать ему может кто угодно. Без этой
+            # проверки любой посторонний вычитывал /stats и /open — то есть
+            # позиции и статистику владельца.
+            if chat != tg.chat_id:
+                log.warning("Команда %r из чужого чата %s — игнорирую", text, chat)
+                continue
 
             if text.startswith("/stats"):
                 await tg.send("📊 <b>Реальная статистика радара</b>\n<pre>"
-                              + self.j.summary() + "</pre>", chat)
+                              + esc(self.j.summary()) + "</pre>", chat)
             elif text.startswith("/open"):
                 rows = self.j.list_open()
                 if not rows:
                     await tg.send("Открытых сигналов нет.", chat)
                 else:
                     await tg.send("\n".join(
-                        f"#{s.id} {s.symbol} вход ${s.entry_price:.8f} "
+                        f"#{s.id} {esc(s.symbol)} вход ${s.entry_price:.8f} "
                         f"пик ${s.peak_price:.8f}" for s in rows), chat)
             elif text.startswith("/wallets"):
                 up = (time.time() - self.started) / 3600
@@ -250,48 +344,74 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
     radar = Radar(cfg, wallets, journal)
     tick = 0
 
-    async with aiohttp.ClientSession() as session:
-        tg = Telegram(session, cfg["telegram"]["bot_token"],
-                      str(cfg["telegram"]["chat_id"]))
-        await tg.send(
-            f"🛰 Радар запущен.\nКошельков: {len(wallets)}\n"
-            f"Условие сигнала: {cfg['radar']['confluence_wallets']}+ кошелька, "
-            f"{cfg['radar']['min_combined_buy_sol']}+ SOL за "
-            f"{cfg['radar']['confluence_window_min']} мин\n"
-            f"Гейт: {cfg['risk']['gate_mode']}, цель "
-            f"{cfg['risk']['target_hit_rate']*100:.0f}%")
+    try:
+        async with aiohttp.ClientSession() as session:
+            tg = Telegram(session, cfg["telegram"]["bot_token"],
+                          str(cfg["telegram"]["chat_id"]))
+            await tg.send(
+                f"🛰 Радар запущен.\nКошельков: {len(wallets)}\n"
+                f"Условие сигнала: {cfg['radar']['confluence_wallets']}+ кошелька, "
+                f"{cfg['radar']['min_combined_buy_sol']}+ SOL за "
+                f"{cfg['radar']['confluence_window_min']} мин\n"
+                f"Гейт: {cfg['risk']['gate_mode']}, цель "
+                f"{cfg['risk']['target_hit_rate']*100:.0f}%")
 
-        while True:
-            try:
-                await radar.handle_commands(tg)
-                await radar.scan_wallets(session, tg)
-                await radar.monitor_open(session, tg)
-                tick += 1
-                if tick % 200 == 0:
-                    journal.prune_seen()
-            except Exception as e:                              # noqa: BLE001
-                print(f"[loop error] {type(e).__name__}: {e}")
-            await asyncio.sleep(cfg["radar"]["poll_interval_sec"])
+            while True:
+                try:
+                    await radar.handle_commands(tg)
+                    await radar.scan_wallets(session, tg)
+                    await radar.monitor_open(session, tg)
+                    tick += 1
+                    if tick % 200 == 0:
+                        journal.prune_seen()
+                        radar.sweep()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:                          # noqa: BLE001
+                    log.error("Сбой итерации: %s: %s", type(e).__name__, e)
+                    log.debug("traceback", exc_info=True)
+                await asyncio.sleep(cfg["radar"]["poll_interval_sec"])
+    finally:
+        journal.close()
 
 
 def load_wallets(path: str) -> list[str]:
+    """Понимает и qualified.json от анализатора, и обычный список адресов."""
     with open(path, encoding="utf-8") as f:
         if path.endswith(".json"):
             data = json.load(f)
-            return [m["wallet"] for m in data.get("qualified", [])]
-        return [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+            if not isinstance(data, dict) or "qualified" not in data:
+                raise SystemExit(
+                    f"{path}: ожидался вывод wallet_analyzer.py с ключом "
+                    f'"qualified". Для простого списка адресов используй .txt')
+            return [m["wallet"] for m in data["qualified"]
+                    if isinstance(m, dict) and m.get("wallet")]
+        # адрес идёт до комментария: discover.py пишет "<адрес>  # ранних входов: N"
+        return [w for w in (ln.split("#", 1)[0].strip() for ln in f) if w]
 
 
-if __name__ == "__main__":
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--wallets", default="qualified.json")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--db", default="signals.db")
+    p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
+    setup_logging(args.verbose)
     conf = load_config(args.config)
+    require_config(conf, "telegram.bot_token", "telegram.chat_id",
+                   "rpc.helius_api_key")
+
     ws = load_wallets(args.wallets)
     if not ws:
         raise SystemExit("Список кошельков пуст. Сначала прогони wallet_analyzer.py — "
                          "радар без проверенных кошельков бесполезен.")
-    asyncio.run(main_loop(conf, ws, args.db))
+    try:
+        asyncio.run(main_loop(conf, ws, args.db))
+    except KeyboardInterrupt:
+        log.info("Остановлено вручную.")
+
+
+if __name__ == "__main__":
+    main()

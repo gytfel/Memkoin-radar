@@ -37,7 +37,7 @@ radar:
   min_combined_buy_sol: 3.0     # суммарный объём их покупок
   max_token_age_min: 4320       # не старше 3 суток
   cooldown_min: 180             # не сигналить один и тот же токен чаще
-  exit_on_wallet_sell_pct: 50   # если tracked-кошельки скинули >50% — сигнал на выход
+  max_signal_age_h: 24          # сигнал без движения к цели закрывается по времени
 
 safety:
   min_liquidity_usd: 15000
