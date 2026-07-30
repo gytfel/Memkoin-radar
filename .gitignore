@@ -1,0 +1,9 @@
+.env
+*.db
+qualified.json
+candidates.txt
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/

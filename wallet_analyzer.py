@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
+import re
 import statistics
 import sys
 import time
@@ -26,6 +28,8 @@ from dataclasses import asdict, dataclass, field
 
 import aiohttp
 import yaml
+
+log = logging.getLogger("radar")
 
 HELIUS_TX = "https://api.helius.xyz/v0/addresses/{addr}/transactions"
 
@@ -41,45 +45,101 @@ DAY = 86_400
 # --------------------------------------------------------------------------- #
 #  утилиты
 # --------------------------------------------------------------------------- #
+def setup_logging(verbose: bool = False) -> None:
+    """Единая настройка логов. Раньше сетевые ошибки глотались молча."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s",
+        datefmt="%H:%M:%S")
+
+
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         raw = os.path.expandvars(f.read())
-    return yaml.safe_load(raw)
+    cfg = yaml.safe_load(raw)
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"{path}: ожидался YAML-словарь, получено {type(cfg).__name__}")
+    return cfg
+
+
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+ENV_HINT = ("\nКлючи берутся из переменных окружения:\n"
+            "    cp .env.example .env   # вписать значения\n"
+            "    set -a && source .env && set +a")
+
+
+def _dig(cfg: dict, dotted: str):
+    node = cfg
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def require_config(cfg: dict, *dotted_paths: str) -> None:
+    """Падаем сразу и понятно, если ключей нет.
+
+    Без этой проверки `${HELIUS_API_KEY}` уезжал в URL как литерал, все запросы
+    возвращали 4xx, а бот молча крутился вхолостую.
+    """
+    problems: list[str] = []
+    for path in dotted_paths:
+        value = _dig(cfg, path)
+        if value is None or value == "":
+            problems.append(f"{path}: не задан в config.yaml")
+            continue
+        for var in _PLACEHOLDER.findall(str(value)):
+            problems.append(f"{path}: переменная окружения {var} не установлена")
+    if problems:
+        raise SystemExit("Конфиг не готов:\n  " + "\n  ".join(problems) + "\n" + ENV_HINT)
+
+
+def _safe_url(url: str) -> str:
+    """Прячем секреты: они попадают и в api-key, и в путь телеграм-бота."""
+    url = re.sub(r"(api-key=)[^&]+", r"\1***", url)
+    return re.sub(r"/bot[^/]+/", "/bot***/", url)
+
+
+async def _request(session: aiohttp.ClientSession, method: str, url: str, *,
+                   params=None, payload=None, retries: int = 4, timeout: int = 30):
+    """HTTP с бэкоффом. Возвращает None вместо исключения — радар не должен падать."""
+    last = "неизвестно"
+    for attempt in range(retries):
+        try:
+            async with session.request(
+                    method, url, params=params, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status == 429:
+                    last = "HTTP 429 (rate limit)"
+                    if attempt < retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    continue
+                if r.status >= 400:
+                    body = (await r.text())[:200]
+                    log.warning("%s %s → HTTP %s %s", method, _safe_url(url), r.status, body)
+                    return None
+                return await r.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last = f"{type(e).__name__}: {e}"
+            if attempt < retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+    log.warning("%s %s не удался за %d попыток (%s)",
+                method, _safe_url(url), retries, last)
+    return None
 
 
 async def get_json(session: aiohttp.ClientSession, url: str, params=None,
                    retries: int = 4, timeout: int = 30):
-    """GET с бэкоффом. Возвращает None вместо исключения — радар не должен падать."""
-    for attempt in range(retries):
-        try:
-            async with session.get(url, params=params,
-                                   timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                if r.status == 429:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                if r.status >= 400:
-                    return None
-                return await r.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            await asyncio.sleep(1.5 ** attempt)
-    return None
+    return await _request(session, "GET", url, params=params,
+                          retries=retries, timeout=timeout)
 
 
 async def post_json(session: aiohttp.ClientSession, url: str, payload: dict,
                     retries: int = 4, timeout: int = 30):
-    for attempt in range(retries):
-        try:
-            async with session.post(url, json=payload,
-                                    timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                if r.status == 429:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                if r.status >= 400:
-                    return None
-                return await r.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            await asyncio.sleep(1.5 ** attempt)
-    return None
+    return await _request(session, "POST", url, payload=payload,
+                          retries=retries, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,27 +234,37 @@ async def fetch_swaps(session, wallet: str, cfg: dict, pages: int | None = None,
     key = cfg["rpc"]["helius_api_key"]
     limit = cfg["analyzer"]["page_limit"]
     sol_usd = cfg["analyzer"]["sol_usd_fallback"]
-    pages = pages or cfg["analyzer"]["max_tx_pages"]
+    pages = cfg["analyzer"]["max_tx_pages"] if pages is None else pages
 
     url = HELIUS_TX.format(addr=wallet)
     before, out = None, []
 
-    for _ in range(pages):
+    for _ in range(max(1, pages)):
         params = {"api-key": key, "limit": limit, "type": "SWAP"}
         if before:
             params["before"] = before
         data = await get_json(session, url, params)
-        if not data:
+
+        # Helius на ошибке отдаёт 200 + {"error": ...}: без этой проверки
+        # цикл ниже итерировался по ключам словаря и падал с AttributeError.
+        if isinstance(data, dict):
+            log.warning("Helius вернул ошибку для %s: %s",
+                        wallet[:8], data.get("error") or data)
+            break
+        if not isinstance(data, list) or not data:
             break
 
         for tx in data:
+            if not isinstance(tx, dict):
+                continue
             s = parse_swap(tx, wallet, sol_usd)
             if s:
                 out.append(s)
 
-        before = data[-1].get("signature")
-        oldest = int(data[-1].get("timestamp") or 0)
-        if len(data) < limit or (until_ts and oldest < until_ts):
+        last = data[-1] if isinstance(data[-1], dict) else {}
+        before = last.get("signature")
+        oldest = int(last.get("timestamp") or 0)
+        if not before or len(data) < limit or (until_ts and oldest < until_ts):
             break
 
     out.sort(key=lambda s: s.ts)
@@ -447,6 +517,9 @@ async def run(wallets: list[str], cfg: dict, out_path: str):
                 try:
                     m = await analyze_wallet(session, w, cfg)
                 except Exception as e:                      # noqa: BLE001
+                    log.warning("Кошелёк %s не проанализирован: %s: %s",
+                                w[:8], type(e).__name__, e)
+                    log.debug("traceback", exc_info=True)
                     m = WalletMetrics(wallet=w, flags=[f"error:{type(e).__name__}"])
                 results.append(m)
                 ok, why = qualifies(m, cfg["analyzer"])
@@ -475,19 +548,24 @@ async def run(wallets: list[str], cfg: dict, out_path: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--wallets", help="файл со адресами, по одному в строке")
+    p.add_argument("--wallets", help="файл с адресами, по одному в строке")
     p.add_argument("--wallet", action="append", default=[], help="адрес (можно несколько)")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--out", default="qualified.json")
+    p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
+    setup_logging(args.verbose)
     cfg = load_config(args.config)
+    require_config(cfg, "rpc.helius_api_key")
+
     addrs = list(args.wallet)
     if args.wallets:
         with open(args.wallets, encoding="utf-8") as f:
-            addrs += [ln.strip() for ln in f
-                      if ln.strip() and not ln.startswith("#")]
-    addrs = list(dict.fromkeys(addrs))
+            # у кандидатов из discover.py адрес идёт до комментария "# ранних входов: N"
+            addrs += [ln.split("#", 1)[0].strip() for ln in f
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+    addrs = [a for a in dict.fromkeys(addrs) if a]
     if not addrs:
         sys.exit("Нужен --wallet или --wallets")
 

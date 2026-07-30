@@ -10,9 +10,8 @@ token_safety.py — фильтр «это не откровенный скам»
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-
-import aiohttp
 
 from wallet_analyzer import get_json, post_json
 
@@ -40,13 +39,22 @@ class TokenSafety:
     pair_url: str = ""
 
 
+def _num(value, default: float = 0.0) -> float:
+    """Dexscreener отдаёт числа строками, а иногда null или мусор."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 async def dexscreener(session, mint: str) -> dict | None:
     data = await get_json(session, DEXSCREENER.format(mint=mint))
-    pairs = (data or {}).get("pairs") or []
+    pairs = (data or {}).get("pairs") if isinstance(data, dict) else None
+    pairs = [p for p in (pairs or []) if isinstance(p, dict)]
     if not pairs:
         return None
     # берём пару с максимальной ликвидностью
-    return max(pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0))
+    return max(pairs, key=lambda p: _num((p.get("liquidity") or {}).get("usd")))
 
 
 async def mint_authorities(session, rpc: str, mint: str) -> tuple[str | None, str | None, float]:
@@ -56,11 +64,13 @@ async def mint_authorities(session, rpc: str, mint: str) -> tuple[str | None, st
     res = await post_json(session, rpc, body)
     try:
         info = res["result"]["value"]["data"]["parsed"]["info"]
-    except (TypeError, KeyError):
+    except (TypeError, KeyError, IndexError):
         return None, None, 0.0
-    dec = int(info.get("decimals") or 0)
-    supply = float(info.get("supply") or 0) / (10 ** dec) if dec else float(info.get("supply") or 0)
-    return info.get("mintAuthority"), info.get("freezeAuthority"), supply
+    if not isinstance(info, dict):
+        return None, None, 0.0
+    dec = int(_num(info.get("decimals")))
+    supply = _num(info.get("supply"))
+    return info.get("mintAuthority"), info.get("freezeAuthority"), supply / (10 ** dec)
 
 
 async def top10_share(session, rpc: str, mint: str, supply: float) -> float:
@@ -71,15 +81,15 @@ async def top10_share(session, rpc: str, mint: str, supply: float) -> float:
     res = await post_json(session, rpc, body)
     try:
         accounts = res["result"]["value"]
-    except (TypeError, KeyError):
+    except (TypeError, KeyError, IndexError):
         return 0.0
-    total = 0.0
-    for acc in accounts[:10]:
-        try:
-            total += float(acc.get("uiAmount") or 0)
-        except (TypeError, ValueError):
-            continue
-    return round(total / supply * 100, 2)
+    if not isinstance(accounts, list):
+        return 0.0
+    total = sum(_num((acc or {}).get("uiAmount")) for acc in accounts[:10]
+                if isinstance(acc, dict))
+    # доля не может быть больше 100%: supply и балансы приходят из разных
+    # запросов и на свежих токенах успевают разъехаться
+    return round(min(total / supply * 100, 100.0), 2)
 
 
 async def rugcheck(session, mint: str) -> int | None:
@@ -104,18 +114,17 @@ async def check_token(session, mint: str, cfg: dict) -> TokenSafety:
         return s
 
     s.symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
-    s.price_usd = float(pair.get("priceUsd") or 0)
-    s.liquidity_usd = float((pair.get("liquidity") or {}).get("usd") or 0)
-    s.fdv_usd = float(pair.get("fdv") or pair.get("marketCap") or 0)
-    s.vol_h1 = float((pair.get("volume") or {}).get("h1") or 0)
+    s.price_usd = _num(pair.get("priceUsd"))
+    s.liquidity_usd = _num((pair.get("liquidity") or {}).get("usd"))
+    s.fdv_usd = _num(pair.get("fdv")) or _num(pair.get("marketCap"))
+    s.vol_h1 = _num((pair.get("volume") or {}).get("h1"))
     txns_m5 = (pair.get("txns") or {}).get("m5") or {}
-    s.buys_m5 = int(txns_m5.get("buys") or 0)
-    s.sells_m5 = int(txns_m5.get("sells") or 0)
+    s.buys_m5 = int(_num(txns_m5.get("buys")))
+    s.sells_m5 = int(_num(txns_m5.get("sells")))
     s.pair_url = pair.get("url") or f"https://dexscreener.com/solana/{mint}"
-    created_ms = pair.get("pairCreatedAt")
-    if created_ms:
-        import time as _t
-        s.age_min = round((_t.time() - created_ms / 1000) / 60, 1)
+    created_ms = _num(pair.get("pairCreatedAt"))
+    if created_ms > 0:
+        s.age_min = round(max(0.0, time.time() - created_ms / 1000) / 60, 1)
 
     s.mint_authority, s.freeze_authority, supply = await mint_authorities(session, rpc, mint)
     s.top10_pct = await top10_share(session, rpc, mint, supply)
@@ -136,7 +145,8 @@ async def check_token(session, mint: str, cfg: dict) -> TokenSafety:
         s.reasons.append(f"rugcheck score {s.rugcheck_score}")
     if s.sells_m5 and s.buys_m5 / max(s.sells_m5, 1) < sf["min_buys_sells_ratio"]:
         s.reasons.append("продавцов больше, чем покупателей")
-    if cfg["radar"]["max_token_age_min"] and s.age_min > cfg["radar"]["max_token_age_min"]:
+    max_age = (cfg.get("radar") or {}).get("max_token_age_min")
+    if max_age and s.age_min > max_age:
         s.reasons.append(f"токену {s.age_min/60:.1f} ч — вне окна радара")
 
     s.ok = not s.reasons
@@ -145,4 +155,4 @@ async def check_token(session, mint: str, cfg: dict) -> TokenSafety:
 
 async def price_usd(session, mint: str) -> float:
     pair = await dexscreener(session, mint)
-    return float(pair.get("priceUsd") or 0) if pair else 0.0
+    return _num(pair.get("priceUsd")) if pair else 0.0

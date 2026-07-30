@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_bucket ON signals(bucket);
+CREATE INDEX IF NOT EXISTS idx_mint_ts ON signals(mint, ts);
 CREATE TABLE IF NOT EXISTS seen_sigs (sig TEXT PRIMARY KEY, ts INTEGER);
+CREATE INDEX IF NOT EXISTS idx_seen_ts ON seen_sigs(ts);
 """
 
 
@@ -63,6 +65,15 @@ class SignalJournal:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
         self.db.commit()
+
+    def close(self) -> None:
+        self.db.close()
+
+    def __enter__(self) -> "SignalJournal":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ------------------------------------------------------------------ #
     def already_seen(self, sig: str) -> bool:
@@ -103,14 +114,22 @@ class SignalJournal:
     def list_open(self) -> list[OpenSignal]:
         rows = self.db.execute(
             "SELECT * FROM signals WHERE status='open' ORDER BY ts").fetchall()
-        return [OpenSignal(r["id"], r["mint"], r["symbol"], r["entry_price"],
-                           r["sl_price"], json.loads(r["tp_prices"]),
-                           r["peak_price"], r["ts"], bool(r["delivered"]))
-                for r in rows]
+        out: list[OpenSignal] = []
+        for r in rows:
+            try:
+                tps = [float(p) for p in json.loads(r["tp_prices"])]
+            except (TypeError, ValueError):
+                tps = []
+            out.append(OpenSignal(r["id"], r["mint"], r["symbol"] or "?",
+                                  r["entry_price"], r["sl_price"], tps,
+                                  r["peak_price"] or 0.0, r["ts"],
+                                  bool(r["delivered"])))
+        return out
 
     def update_peak(self, sid: int, price: float) -> None:
+        # COALESCE: sqlite-шный MAX(a,b) возвращает NULL, если любой аргумент NULL
         self.db.execute(
-            "UPDATE signals SET peak_price=MAX(peak_price,?) WHERE id=?",
+            "UPDATE signals SET peak_price=MAX(COALESCE(peak_price,0),?) WHERE id=?",
             (price, sid))
         self.db.commit()
 
@@ -119,12 +138,14 @@ class SignalJournal:
                              (sid,)).fetchone()
         r_mult = None
         if row:
-            risk = row["entry_price"] - row["sl_price"]
+            risk = (row["entry_price"] or 0) - (row["sl_price"] or 0)
             if risk > 0:
                 r_mult = round((exit_price - row["entry_price"]) / risk, 2)
+        # status='open' в условии: сигнал нельзя закрыть дважды и переписать исход
         self.db.execute(
             "UPDATE signals SET status=?, exit_price=?, exit_ts=?, r_multiple=? "
-            "WHERE id=?", (status, exit_price, int(time.time()), r_mult, sid))
+            "WHERE id=? AND status='open'",
+            (status, exit_price, int(time.time()), r_mult, sid))
         self.db.commit()
 
     def is_on_cooldown(self, mint: str, minutes: int) -> bool:

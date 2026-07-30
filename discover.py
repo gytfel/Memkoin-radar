@@ -13,19 +13,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from collections import Counter
 
 import aiohttp
 
-from wallet_analyzer import load_config, parse_swap, post_json
+from wallet_analyzer import (load_config, parse_swap, post_json, require_config,
+                             setup_logging)
 
 HELIUS_PARSE = "https://api.helius.xyz/v0/transactions"
+
+log = logging.getLogger("radar")
 
 
 async def oldest_signatures(session, rpc: str, mint: str,
                             max_pages: int = 25, page: int = 1000) -> list[str]:
     """Листаем историю адреса минта до самого начала, возвращаем самые старые подписи."""
     before, sigs = None, []
+    exhausted = False
     for _ in range(max_pages):
         params: dict = {"limit": page}
         if before:
@@ -33,23 +38,36 @@ async def oldest_signatures(session, rpc: str, mint: str,
         body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [mint, params]}
         res = await post_json(session, rpc, body)
-        batch = (res or {}).get("result") or []
+        if isinstance(res, dict) and res.get("error"):
+            log.warning("RPC вернул ошибку для %s: %s", mint[:8], res["error"])
+            break
+        batch = (res or {}).get("result") if isinstance(res, dict) else None
+        batch = [s for s in (batch or []) if isinstance(s, dict) and s.get("signature")]
         if not batch:
+            exhausted = True
             break
         sigs.extend(s["signature"] for s in batch)
         before = batch[-1]["signature"]
         if len(batch) < page:
+            exhausted = True
             break
+        await asyncio.sleep(0.2)          # RPC-лимиты: 25 страниц подряд ловят 429
+    if not exhausted:
+        # иначе «ранние покупатели» молча окажутся не самыми ранними
+        log.warning("%s: история длиннее %d стр. — до первых покупок не долистали, "
+                    "результат по этому минту неполный", mint[:8], max_pages)
     return sigs[::-1]  # от старых к новым
 
 
 async def parse_batch(session, key: str, sigs: list[str]) -> list[dict]:
     out = []
-    for i in range(0, len(sigs), 100):
+    for i in range(0, len(sigs), 100):     # Helius принимает не больше 100 за раз
         res = await post_json(session, f"{HELIUS_PARSE}?api-key={key}",
                               {"transactions": sigs[i:i + 100]})
-        if res:
-            out.extend(res)
+        if isinstance(res, list):
+            out.extend(tx for tx in res if isinstance(tx, dict))
+        elif isinstance(res, dict) and res.get("error"):
+            log.warning("Helius не разобрал пачку транзакций: %s", res["error"])
         await asyncio.sleep(0.2)
     return out
 
@@ -94,12 +112,21 @@ async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
     print(f"\n{len(picked)} кандидатов (>= {min_hits} попаданий) → {out}")
 
 
-if __name__ == "__main__":
+def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--mint", action="append", required=True,
                    help="минт токена, который уже отработал (можно несколько раз)")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--out", default="candidates.txt")
     p.add_argument("--min-hits", type=int, default=2)
+    p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args()
-    asyncio.run(run(a.mint, load_config(a.config), a.out, a.min_hits))
+
+    setup_logging(a.verbose)
+    cfg = load_config(a.config)
+    require_config(cfg, "rpc.helius_api_key", "rpc.rpc_url")
+    asyncio.run(run(a.mint, cfg, a.out, a.min_hits))
+
+
+if __name__ == "__main__":
+    main()
