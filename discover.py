@@ -97,7 +97,7 @@ async def early_buyers(session, cfg: dict, mint: str, first_n: int = 400) -> lis
 
 async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
     counter: Counter[str] = Counter()
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         for mint in mints:
             for w in await early_buyers(session, cfg, mint):
                 counter[w] += 1

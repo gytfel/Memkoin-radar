@@ -150,6 +150,41 @@ def require_config(cfg: dict, *dotted_paths: str) -> None:
         raise SystemExit("Конфиг не готов:\n  " + "\n  ".join(problems) + "\n" + ENV_HINT)
 
 
+def _safe_proxy(proxy: str) -> str:
+    """Прячем логин и пароль: прокси часто выдают с ними в адресе."""
+    return re.sub(r"://[^@/]+@", "://***@", proxy)
+
+
+def make_session(**kw) -> aiohttp.ClientSession:
+    """Сессия, умеющая ходить через прокси.
+
+    Обычный aiohttp.ClientSession игнорирует HTTPS_PROXY: переменную нужно
+    разрешить явным trust_env. Из-за этого в сетях, где api.telegram.org
+    закрыт провайдером, бот молчал даже с настроенным системным прокси —
+    Helius при этом отвечал, и выглядело это как поломка именно бота.
+
+    Адрес берётся из HTTPS_PROXY, её можно положить прямо в .env.
+    """
+    proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "").strip()
+    if not proxy:
+        return aiohttp.ClientSession(trust_env=True, **kw)
+
+    if proxy.lower().startswith("socks"):
+        # aiohttp сам socks не умеет — нужен отдельный коннектор
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError:
+            raise SystemExit(
+                f"HTTPS_PROXY={_safe_proxy(proxy)} — это socks-прокси, "
+                f"для него нужен дополнительный пакет:\n"
+                f"    pip install aiohttp-socks") from None
+        log.info("Работаю через socks-прокси %s", _safe_proxy(proxy))
+        return aiohttp.ClientSession(connector=ProxyConnector.from_url(proxy), **kw)
+
+    log.info("Работаю через прокси %s", _safe_proxy(proxy))
+    return aiohttp.ClientSession(trust_env=True, **kw)
+
+
 def _safe_url(url: str) -> str:
     """Прячем секреты: они попадают и в api-key, и в путь телеграм-бота."""
     url = re.sub(r"(api-key=)[^&]+", r"\1***", url)
@@ -565,7 +600,7 @@ async def run(wallets: list[str], cfg: dict, out_path: str):
     sem = asyncio.Semaphore(cfg["analyzer"]["concurrency"])
     results: list[WalletMetrics] = []
 
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         async def worker(w: str):
             async with sem:
                 try:

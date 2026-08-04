@@ -31,8 +31,9 @@ import aiohttp
 
 import token_safety as ts
 from signal_journal import SignalJournal
-from wallet_analyzer import (fetch_swaps, get_json, load_config, post_json,
-                             require_config, setup_logging)
+from wallet_analyzer import (fetch_swaps, get_json, load_config,
+                             make_session, post_json, require_config,
+                             setup_logging)
 
 TG = "https://api.telegram.org/bot{token}/{method}"
 TG_LIMIT = 4096          # жёсткий лимит длины сообщения в Telegram
@@ -355,7 +356,7 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
     tick = 0
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with make_session() as session:
             tg = Telegram(session, cfg["telegram"]["bot_token"],
                           str(cfg["telegram"]["chat_id"]))
             # Без этой строки здоровый радар не печатал вообще ничего: все

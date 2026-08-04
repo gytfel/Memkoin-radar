@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 
 import aiohttp
 
 from radar_bot import TG, load_wallets
-from wallet_analyzer import HELIUS_TX, load_config
+from wallet_analyzer import HELIUS_TX, _safe_proxy, load_config, make_session
 
 YES, NO, HMM = "  ✔  ", "  ✘  ", "  !  "
 
@@ -89,9 +90,18 @@ async def check_telegram(session, token: str, chat_id: str) -> None:
 
     code, body = await _probe(session, "GET", TG.format(token=token, method="getMe"))
     if code is None:
+        # Отказ на уровне соединения, а не ответ Telegram. Если при этом
+        # Helius отвечает, интернет цел и закрыт именно api.telegram.org —
+        # у российских провайдеров это норма, а не поломка бота.
         say(NO, f"до api.telegram.org не достучались ({body})",
-            "Проверь интернет, прокси и файрвол.\n"
-            "В некоторых сетях Telegram API закрыт — нужен VPN или другой хост.")
+            "Похоже, провайдер закрыл доступ к Telegram API.\n"
+            "Варианты, по возрастанию надёжности:\n"
+            "1) включить VPN на всём компьютере и перезапустить радар;\n"
+            "2) прописать прокси в .env — тогда VPN не нужен:\n"
+            "     HTTPS_PROXY=http://логин:пароль@адрес:порт\n"
+            "     socks5 тоже годится, но к нему: pip install aiohttp-socks\n"
+            "3) арендовать VPS за границей и запускать радар там —\n"
+            "   он всё равно должен работать круглосуточно.")
         return
     if code == 401:
         say(NO, "токен отклонён (401 Unauthorized)",
@@ -185,6 +195,11 @@ def check_config(cfg: dict, path: str) -> tuple[str, str, str]:
                 f"Значение {env} пустое — проверь .env")
         else:
             say(YES, f"{name} задан")
+
+    # Показываем явно: иначе непонятно, идут запросы напрямую или через прокси,
+    # и почему настроенный в системе прокси мог не примениться.
+    proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "").strip()
+    say(YES, f"прокси: {_safe_proxy(proxy)}" if proxy else "прокси не задан, идём напрямую")
     return token, chat, key
 
 
@@ -210,7 +225,7 @@ async def run(args) -> int:
     token, chat, key = check_config(cfg, args.config)
     wallet = check_wallets(args.wallets)
 
-    async with aiohttp.ClientSession() as session:
+    async with make_session() as session:
         if token and not token.startswith("${"):
             await check_telegram(session, token, chat)
         if key and not key.startswith("${"):
