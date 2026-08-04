@@ -1,0 +1,11 @@
+# Кошельки, за которыми следит радар: python radar_bot.py --wallets wallets.txt
+#
+# Это сырой список, не проверенный анализатором. Прежде чем торговать по его
+# сигналам, прогони фильтр — он отсеет мешочников, фарм микро-суммами и
+# снайпер-ботов, за которыми руками не успеть:
+#     python wallet_analyzer.py --wallets wallets.txt --out qualified.json
+#     python radar_bot.py --wallets qualified.json
+
+6S8GezkxYUfZy9JPtYnanbcZTMB87Wjt1qx3c6ELajKC
+CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o
+Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt
