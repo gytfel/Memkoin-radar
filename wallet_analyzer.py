@@ -53,7 +53,45 @@ def setup_logging(verbose: bool = False) -> None:
         datefmt="%H:%M:%S")
 
 
+def load_dotenv(path: str) -> None:
+    """Подтягиваем ключи из .env.
+
+    Раньше файл читал только шелл: без `set -a && source .env && set +a` токен
+    не доезжал до процесса, и запуск падал на require_config, хотя значения
+    были вписаны. Уже заданное окружение приоритетнее файла — переменную,
+    выставленную в шелле или в systemd-юните, молча перетирать нельзя.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return                      # .env необязателен: ключи можно задать и извне
+
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key.isidentifier():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        else:
+            # хвостовой комментарий: "KEY=значение  # пояснение".
+            # Только у неэкранированного значения — внутри кавычек # легален.
+            value = value.split(" #", 1)[0].rstrip()
+        # не setdefault: `cp .env.example .env` + source экспортирует пустые
+        # строки, и они бы навсегда заслонили реальные значения из файла
+        if not os.environ.get(key):
+            os.environ[key] = value
+
+
 def load_config(path: str = "config.yaml") -> dict:
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(path)), ".env"))
     with open(path, "r", encoding="utf-8") as f:
         raw = os.path.expandvars(f.read())
     cfg = yaml.safe_load(raw)
@@ -64,9 +102,8 @@ def load_config(path: str = "config.yaml") -> dict:
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
-ENV_HINT = ("\nКлючи берутся из переменных окружения:\n"
-            "    cp .env.example .env   # вписать значения\n"
-            "    set -a && source .env && set +a")
+ENV_HINT = ("\nКлючи берутся из .env рядом с config.yaml (или из окружения):\n"
+            "    cp .env.example .env   # вписать значения и запускать как обычно")
 
 
 def _dig(cfg: dict, dotted: str):
