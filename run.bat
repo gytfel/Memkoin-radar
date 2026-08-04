@@ -9,14 +9,24 @@ rem Запускать двойным кликом. Окно НЕ закроет
 rem иначе при любой ошибке текст исчезал бы вместе с окном.
 
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
 
+rem Проверяем Python запуском, а не через where. Причина: в Windows 10/11
+rem есть заглушка python.exe, которая существует в PATH, но вместо
+rem интерпретатора открывает Microsoft Store. where её находит, запуск
+rem проваливается - и человек видит магазин вместо бота.
+rem Лаунчер py надёжнее, поэтому пробуем его первым.
 set PY=
-where python >nul 2>&1 && set PY=python
-if "%PY%"=="" (where py >nul 2>&1 && set PY=py)
-if "%PY%"=="" (
-    echo Python не найден. Поставь его с python.org
-    echo ВАЖНО: при установке отметь галочку "Add Python to PATH".
+py -3 -c "import sys" >nul 2>&1 && set PY=py -3
+if not defined PY (python -c "import sys" >nul 2>&1 && set PY=python)
+if not defined PY (
+    echo Рабочий Python не найден.
+    echo.
+    echo Поставь его с https://www.python.org/downloads/
+    echo ВАЖНО: на первом экране установщика отметь галочку
+    echo "Add python.exe to PATH", иначе запуск не увидит Python.
+    echo После установки закрой это окно и запусти run.bat снова.
     goto :end
 )
 %PY% --version
@@ -24,17 +34,19 @@ if "%PY%"=="" (
 if not exist .env (
     copy .env.example .env >nul
     echo.
-    echo Создан .env - впиши в него три ключа и запусти снова:
+    echo Создан файл .env - открой его Блокнотом и впиши три ключа:
     echo   HELIUS_API_KEY     - helius.dev
     echo   TELEGRAM_BOT_TOKEN - @BotFather
     echo   TELEGRAM_CHAT_ID   - @userinfobot
+    echo.
+    echo Потом запусти run.bat снова.
     goto :end
 )
 
 echo Ставлю зависимости...
 %PY% -m pip install -q -r requirements.txt
 if errorlevel 1 (
-    echo Не удалось установить зависимости.
+    echo Не удалось установить зависимости. Проверь интернет.
     goto :end
 )
 
@@ -44,12 +56,13 @@ echo === Диагностика ===
 if errorlevel 1 (
     echo.
     echo Радар не запущен: сначала устрани проблемы выше.
-    echo Отчёт целиком лежит в doctor.log
+    echo Отчёт целиком лежит в файле doctor.log
     goto :end
 )
 
 echo.
-echo === Радар работает. Ctrl+C чтобы остановить ===
+echo === Радар работает. Не закрывай это окно ===
+echo === Остановить: Ctrl+C ===
 %PY% radar_bot.py --wallets wallets.txt --log-file radar.log
 
 :end
