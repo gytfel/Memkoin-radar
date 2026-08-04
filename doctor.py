@@ -27,12 +27,24 @@ from wallet_analyzer import HELIUS_TX, load_config
 YES, NO, HMM = "  ✔  ", "  ✘  ", "  !  "
 
 _problems: list[str] = []
+_report: list[str] = []
+
+
+def out(line: str = "") -> None:
+    """Печатаем и одновременно копим отчёт.
+
+    Скрипт часто запускают двойным кликом: окно закрывается вместе с
+    выводом, и показать результат становится нечем. Поэтому отчёт всегда
+    ложится ещё и в файл.
+    """
+    print(line)
+    _report.append(line)
 
 
 def say(mark: str, line: str, fix: str = "") -> None:
-    print(f"{mark}{line}")
+    out(f"{mark}{line}")
     for row in fix.split("\n") if fix else ():
-        print(f"       → {row}")
+        out(f"       → {row}")
     # считаем провал провалом даже без готового рецепта: иначе неизвестная
     # ошибка тихо выпадала из итога, и отчёт врал, что всё почти хорошо
     if mark == NO:
@@ -64,7 +76,7 @@ def _desc(body) -> str:
 
 # --------------------------------------------------------------------------- #
 async def check_telegram(session, token: str, chat_id: str) -> None:
-    print("\n== Telegram ==")
+    out("\n== Telegram ==")
 
     # ID бота — это часть токена до двоеточия. Если chat_id совпал с ним,
     # человек принял бота за адресата: сам себе бот написать не может.
@@ -134,7 +146,7 @@ async def check_telegram(session, token: str, chat_id: str) -> None:
 
 # --------------------------------------------------------------------------- #
 async def check_helius(session, key: str, wallet: str | None) -> None:
-    print("\n== Helius ==")
+    out("\n== Helius ==")
     probe = wallet or "So11111111111111111111111111111111111111112"
     code, body = await _probe(session, "GET", HELIUS_TX.format(addr=probe),
                               params={"api-key": key, "limit": 1, "type": "SWAP"})
@@ -158,7 +170,7 @@ async def check_helius(session, key: str, wallet: str | None) -> None:
 
 # --------------------------------------------------------------------------- #
 def check_config(cfg: dict, path: str) -> tuple[str, str, str]:
-    print("== Конфиг ==")
+    out("== Конфиг ==")
     token = str(cfg.get("telegram", {}).get("bot_token") or "")
     chat = str(cfg.get("telegram", {}).get("chat_id") or "")
     key = str(cfg.get("rpc", {}).get("helius_api_key") or "")
@@ -204,25 +216,41 @@ async def run(args) -> int:
         if key and not key.startswith("${"):
             await check_helius(session, key, wallet)
 
-    print()
+    out()
     if _problems:
-        print(f"Найдено проблем: {len(_problems)}. Пока они не устранены, "
+        out(f"Найдено проблем: {len(_problems)}. Пока они не устранены, "
               f"радар будет молчать.")
         for p in _problems:
-            print(f"  · {p}")
+            out(f"  · {p}")
         return 1
-    print("Всё в порядке. Запуск:")
-    print(f"    python wallet_analyzer.py --wallets {args.wallets} --out qualified.json")
-    print("    python radar_bot.py --wallets qualified.json")
+    out("Всё в порядке. Запуск:")
+    out(f"    python wallet_analyzer.py --wallets {args.wallets} --out qualified.json")
+    out("    python radar_bot.py --wallets qualified.json")
     return 0
+
+
+def save_report(path: str) -> None:
+    """Отчёт нужен ровно тогда, когда его не видно на экране."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(_report) + "\n")
+        print(f"\nОтчёт сохранён: {path}")
+    except OSError as e:
+        print(f"\nОтчёт не удалось сохранить в {path}: {e}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--wallets", default="wallets.txt")
+    p.add_argument("--out", default="doctor.log", help="куда сохранить отчёт")
     args = p.parse_args()
-    raise SystemExit(asyncio.run(run(args)))
+    try:
+        code = asyncio.run(run(args))
+    finally:
+        # и при падении самой диагностики: пустой лог хуже частичного
+        save_report(args.out)
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

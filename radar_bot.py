@@ -425,17 +425,30 @@ def main() -> None:
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--db", default="signals.db")
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--log-file", help="дублировать лог в файл (когда консоли не видно)")
     args = p.parse_args()
 
-    setup_logging(args.verbose)
-    conf = load_config(args.config)
-    require_config(conf, "telegram.bot_token", "telegram.chat_id",
-                   "rpc.helius_api_key")
+    setup_logging(args.verbose, args.log_file)
 
-    ws = load_wallets(args.wallets)
-    if not ws:
-        raise SystemExit("Список кошельков пуст. Сначала прогони wallet_analyzer.py — "
-                         "радар без проверенных кошельков бесполезен.")
+    # Всё, что до этого падало через SystemExit, писало причину в stderr мимо
+    # логов: в --log-file не попадала как раз самая нужная строка — почему
+    # радар не взлетел. Для запуска двойным кликом это означало пустой файл.
+    try:
+        conf = load_config(args.config)
+        require_config(conf, "telegram.bot_token", "telegram.chat_id",
+                       "rpc.helius_api_key")
+        ws = load_wallets(args.wallets)
+        if not ws:
+            raise SystemExit("Список кошельков пуст. Сначала прогони "
+                             "wallet_analyzer.py — радар без проверенных "
+                             "кошельков бесполезен.")
+    except SystemExit as e:
+        log.error("Запуск прерван. %s", e)
+        raise
+    except OSError as e:
+        log.error("Запуск прерван: %s", e)
+        raise SystemExit(1) from e
+
     try:
         asyncio.run(main_loop(conf, ws, args.db))
     except KeyboardInterrupt:

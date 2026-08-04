@@ -45,12 +45,22 @@ DAY = 86_400
 # --------------------------------------------------------------------------- #
 #  утилиты
 # --------------------------------------------------------------------------- #
-def setup_logging(verbose: bool = False) -> None:
-    """Единая настройка логов. Раньше сетевые ошибки глотались молча."""
+def setup_logging(verbose: bool = False, log_file: str | None = None) -> None:
+    """Единая настройка логов. Раньше сетевые ошибки глотались молча.
+
+    log_file дублирует всё в файл. Нужен, когда консоли фактически нет:
+    скрипт запустили двойным кликом и окно закрылось, или он крутится
+    в фоне. Без файла разбираться потом не с чем.
+    """
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        datefmt="%H:%M:%S")
+        datefmt="%H:%M:%S", handlers=handlers)
+    if log_file:
+        log.info("Лог пишется в %s", os.path.abspath(log_file))
 
 
 def load_dotenv(path: str) -> None:
