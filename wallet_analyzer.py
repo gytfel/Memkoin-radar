@@ -91,7 +91,14 @@ def load_dotenv(path: str) -> None:
 
 
 def load_config(path: str = "config.yaml") -> dict:
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(path)), ".env"))
+    # .env ищем и рядом с конфигом, и в рабочем каталоге: конфиг могут вынести
+    # в /etc или передать через --config, а ключи оставить там, откуда
+    # запускают. Первый найденный выигрывает — load_dotenv не перетирает
+    # уже заданное.
+    for candidate in (os.path.join(os.path.dirname(os.path.abspath(path)), ".env"),
+                      os.path.join(os.getcwd(), ".env")):
+        load_dotenv(candidate)
+
     with open(path, "r", encoding="utf-8") as f:
         raw = os.path.expandvars(f.read())
     cfg = yaml.safe_load(raw)

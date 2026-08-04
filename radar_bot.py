@@ -75,7 +75,13 @@ class Telegram:
             out.append(cur)
         return out
 
-    async def send(self, text: str, chat_id: str | None = None) -> None:
+    async def send(self, text: str, chat_id: str | None = None) -> bool:
+        """True, если Telegram принял всё сообщение целиком.
+
+        Возврат нужен вызывающему: молчание в чате и молчание в логе
+        выглядят одинаково, а причины у них разные.
+        """
+        ok = True
         for part in self._chunks(text):
             res = await post_json(
                 self.s, TG.format(token=self.token, method="sendMessage"),
@@ -83,6 +89,8 @@ class Telegram:
                  "parse_mode": "HTML", "disable_web_page_preview": True})
             if res is None:
                 log.warning("Telegram не принял сообщение (%d символов)", len(part))
+                ok = False
+        return ok
 
     async def poll(self) -> list[dict]:
         data = await get_json(self.s, TG.format(token=self.token, method="getUpdates"),
@@ -235,7 +243,9 @@ class Radar:
         )
         if not allowed:
             msg = "⚠️ <i>ниже целевого winrate, shadow-режим</i>\n\n" + msg
-        await tg.send(msg)
+        if await tg.send(msg):
+            log.info("Сигнал #%s %s отправлен: %d кошелька, %.2f SOL",
+                     sid, safety.symbol, n, total_sol)
 
     # ---------------------------------------------------------------- #
     async def notify_wallet_exit(self, tg: Telegram, mint: str, wallet: str) -> None:
@@ -348,13 +358,28 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
         async with aiohttp.ClientSession() as session:
             tg = Telegram(session, cfg["telegram"]["bot_token"],
                           str(cfg["telegram"]["chat_id"]))
-            await tg.send(
-                f"🛰 Радар запущен.\nКошельков: {len(wallets)}\n"
-                f"Условие сигнала: {cfg['radar']['confluence_wallets']}+ кошелька, "
-                f"{cfg['radar']['min_combined_buy_sol']}+ SOL за "
-                f"{cfg['radar']['confluence_window_min']} мин\n"
-                f"Гейт: {cfg['risk']['gate_mode']}, цель "
-                f"{cfg['risk']['target_hit_rate']*100:.0f}%")
+            # Без этой строки здоровый радар не печатал вообще ничего: все
+            # логи были уровня WARNING, а сетевая ошибка всплывает только
+            # через четыре ретрая с бэкоффом. Со стороны — намертво зависший
+            # процесс, хотя он просто ждёт ответа.
+            log.info("Радар запущен: кошельков %d, опрос каждые %d с, чат %s",
+                     len(wallets), cfg["radar"]["poll_interval_sec"], tg.chat_id)
+
+            if await tg.send(
+                    f"🛰 Радар запущен.\nКошельков: {len(wallets)}\n"
+                    f"Условие сигнала: {cfg['radar']['confluence_wallets']}+ кошелька, "
+                    f"{cfg['radar']['min_combined_buy_sol']}+ SOL за "
+                    f"{cfg['radar']['confluence_window_min']} мин\n"
+                    f"Гейт: {cfg['risk']['gate_mode']}, цель "
+                    f"{cfg['risk']['target_hit_rate']*100:.0f}%"):
+                log.info("Приветствие доставлено — канал до чата работает.")
+            else:
+                log.error("Приветствие НЕ доставлено в чат %s. Сигналы тоже не "
+                          "дойдут. Причину покажет: python doctor.py", tg.chat_id)
+
+            # «Жив» примерно раз в 10 минут — независимо от того, какой
+            # интервал опроса стоит в конфиге.
+            beat = max(1, 600 // max(1, int(cfg["radar"]["poll_interval_sec"])))
 
             while True:
                 try:
@@ -362,6 +387,10 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
                     await radar.scan_wallets(session, tg)
                     await radar.monitor_open(session, tg)
                     tick += 1
+                    if tick % beat == 0:
+                        log.info("Жив: циклов %d, открытых сигналов %d, "
+                                 "проверено кандидатов %d",
+                                 tick, len(journal.list_open()), radar.checked)
                     if tick % 200 == 0:
                         journal.prune_seen()
                         radar.sweep()
