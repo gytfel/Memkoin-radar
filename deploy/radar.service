@@ -1,0 +1,41 @@
+[Unit]
+Description=Memkoin radar - телеграм-бот
+Documentation=https://github.com/gytfel/Memkoin-radar
+# Ждём именно поднятую сеть, а не просто загрузку модуля: иначе после
+# перезагрузки сервера бот стартует раньше сети и тратит первую минуту
+# на бесполезные ретраи.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radar
+Group=radar
+WorkingDirectory=/opt/memkoin-radar
+ExecStart=/opt/memkoin-radar/.venv/bin/python radar_bot.py --wallets wallets.txt
+
+# Радар должен пережить всё: обрыв сети, сбой Helius, падение процесса.
+# Ради этого он и переезжал на сервер.
+Restart=always
+RestartSec=10
+
+# Логи уходят в journalctl, файл не нужен: там ротация из коробки, а
+# --log-file на сервере рос бы бесконечно.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=radar
+
+# Права по минимуму: приватных ключей у бота нет, но и лишнего доступа
+# к системе ему не нужно. Писать он должен только в свой каталог -
+# туда ложатся signals.db и ничего больше.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/memkoin-radar
+
+[Install]
+WantedBy=multi-user.target
