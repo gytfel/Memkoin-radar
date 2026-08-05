@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 
 import aiohttp
 
@@ -73,6 +74,40 @@ def _desc(body) -> str:
     if isinstance(body, dict):
         return str(body.get("description") or body.get("error") or body)[:200]
     return str(body)[:200]
+
+
+# --------------------------------------------------------------------------- #
+async def check_proxy(proxy: str) -> bool:
+    """Жив ли сам прокси.
+
+    Без этой проверки мёртвый прокси выглядел как недоступный Telegram:
+    соединение обрывается одинаково, и совет получался про блокировки,
+    хотя чинить надо было адрес в HTTPS_PROXY. Особенно легко нарваться
+    на 127.0.0.1 — клиент выключили, а строка осталась.
+    """
+    out("\n== Прокси ==")
+    m = re.match(r"^\w+://(?:[^@/]+@)?\[?([^\]:/]+)\]?(?::(\d+))?", proxy)
+    if not m:
+        say(NO, f"не разбирается адрес {_safe_proxy(proxy)}",
+            "Ожидается вид: http://адрес:порт (или socks5://адрес:порт)")
+        return False
+
+    host, port = m.group(1), int(m.group(2) or (443 if "https://" in proxy else 80))
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
+        writer.close()
+    except (OSError, asyncio.TimeoutError) as e:
+        local = host in ("127.0.0.1", "localhost", "::1")
+        say(NO, f"прокси {host}:{port} не отвечает ({type(e).__name__})",
+            ("Порт на твоём же компьютере, значит программа-прокси не запущена.\n"
+             "Запусти VPN-клиент, который его поднимает, — или убери\n"
+             "строку HTTPS_PROXY из .env, если прокси больше нет."
+             if local else
+             "Проверь адрес и порт в HTTPS_PROXY, а также что прокси ещё жив."))
+        return False
+
+    say(YES, f"прокси {host}:{port} отвечает")
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +259,14 @@ async def run(args) -> int:
     cfg = load_config(args.config)
     token, chat, key = check_config(cfg, args.config)
     wallet = check_wallets(args.wallets)
+
+    # Прокси проверяем первым: если мёртв он, все остальные диагнозы будут
+    # враньём — они спишут его отказ на блокировки и неверные ключи.
+    proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "").strip()
+    if proxy and not await check_proxy(proxy):
+        out()
+        out("Дальше проверять нечего: весь трафик идёт через нерабочий прокси.")
+        return 1
 
     async with make_session() as session:
         if token and not token.startswith("${"):
