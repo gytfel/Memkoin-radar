@@ -25,7 +25,9 @@ fi
 echo "1/5 Ставлю системные пакеты..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git
+# tmux нужен не для красоты: pipeline.sh идёт десятки минут, а обрыв ssh
+# убивает его вместе с сеансом — на середине поиска кандидатов это обидно.
+apt-get install -y -qq python3 python3-venv python3-pip git tmux
 
 echo "2/5 Забираю код в $APP_DIR..."
 if [ -d "$APP_DIR/.git" ]; then
