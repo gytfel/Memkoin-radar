@@ -33,10 +33,12 @@ DISCOVER_PAGES="${DISCOVER_PAGES:-200}"
 
 SKIP_DISCOVER=0
 SKIP_ANALYZE=0
+SKIP_UPDATE=0
 for a in "$@"; do
     case "$a" in
         --skip-discover) SKIP_DISCOVER=1 ;;
         --skip-analyze)  SKIP_ANALYZE=1 ;;
+        --skip-update)   SKIP_UPDATE=1 ;;
         *) echo "Неизвестный флаг: $a"; exit 1 ;;
     esac
 done
@@ -87,6 +89,30 @@ if command -v systemctl >/dev/null 2>&1 \
    && systemctl list-unit-files "$SERVICE.service" >/dev/null 2>&1 \
    && [ -f "/etc/systemd/system/$SERVICE.service" ]; then
     HAVE_SERVICE=1
+fi
+
+# --- 0. код -------------------------------------------------------------- #
+# Обновление было в первой версии скрипта и потерялось при переносе в корень
+# проекта. Из-за этого «запусти pipeline.sh» месяцами гоняло бы старый код,
+# а исправления не доезжали бы — что и случилось.
+#
+# Скрипт обновляет сам себя, поэтому после git reset перезапускается: bash
+# дочитывает файл по ходу выполнения, и подмена на лету ломает разбор.
+if [ "$SKIP_UPDATE" -eq 0 ] && [ -z "${PIPELINE_REEXEC:-}" ] && [ -d "$APP_DIR/.git" ]; then
+    step "0/5  Обновляю код"
+    # git от root в каталоге, принадлежащем radar, иначе ругается на владельца
+    git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+    BRANCH=$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ -n "$BRANCH" ] && [ "$BRANCH" != "HEAD" ]; then
+        if git -C "$APP_DIR" fetch --quiet origin "$BRANCH" 2>/dev/null \
+           && git -C "$APP_DIR" reset --quiet --hard "origin/$BRANCH"; then
+            [ -n "$RUN" ] && chown -R radar:radar "$APP_DIR" 2>/dev/null || true
+            echo "код обновлён до $(git -C "$APP_DIR" log --oneline -1)"
+            export PIPELINE_REEXEC=1
+            exec bash "$APP_DIR/pipeline.sh" "$@"
+        fi
+        echo "обновиться не удалось (нет сети?) — продолжаю на текущем коде"
+    fi
 fi
 
 # --- 1. зависимости ------------------------------------------------------ #
