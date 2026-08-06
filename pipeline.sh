@@ -69,7 +69,9 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 grep -q "^TELEGRAM_BOT_TOKEN=." "$ENV_FILE" \
     || die "в $ENV_FILE не заполнен TELEGRAM_BOT_TOKEN. Открой: nano $ENV_FILE"
-"$PY" -m pip install -q -r requirements.txt || die "не установить зависимости"
+# Ставим от того же пользователя, что потом запускает бота: pip от root
+# оставил бы в venv файлы с чужим владельцем.
+$RUN "$PY" -m pip install -q -r requirements.txt || die "не установить зависимости"
 echo "готово"
 
 # --- 2. связь ------------------------------------------------------------ #
