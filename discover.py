@@ -16,10 +16,8 @@ import asyncio
 import logging
 from collections import Counter
 
-import aiohttp
-
-from wallet_analyzer import (load_config, parse_swap, post_json, require_config,
-                             setup_logging)
+from wallet_analyzer import (FetchError, load_config, make_session, parse_swap,
+                             post_json, require_config, setup_logging)
 
 HELIUS_PARSE = "https://api.helius.xyz/v0/transactions"
 
@@ -31,13 +29,21 @@ async def oldest_signatures(session, rpc: str, mint: str,
     """Листаем историю адреса минта до самого начала, возвращаем самые старые подписи."""
     before, sigs = None, []
     exhausted = False
-    for _ in range(max_pages):
+    for attempt in range(max_pages):
         params: dict = {"limit": page}
         if before:
             params["before"] = before
         body = {"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
                 "params": [mint, params]}
         res = await post_json(session, rpc, body)
+
+        # Первая страница особая: без неё про минт не известно ничего, и
+        # «ранних покупателей не нашлось» было бы выводом из пустоты.
+        if attempt == 0 and res is None:
+            raise FetchError(f"RPC не ответил по минту {mint[:8]}")
+        if attempt == 0 and isinstance(res, dict) and res.get("error"):
+            raise FetchError(f"RPC отклонил запрос по {mint[:8]}: {res['error']}")
+
         if isinstance(res, dict) and res.get("error"):
             log.warning("RPC вернул ошибку для %s: %s", mint[:8], res["error"])
             break
@@ -97,10 +103,24 @@ async def early_buyers(session, cfg: dict, mint: str, first_n: int = 400) -> lis
 
 async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
     counter: Counter[str] = Counter()
+    done, failed = 0, []
     async with make_session() as session:
         for mint in mints:
-            for w in await early_buyers(session, cfg, mint):
-                counter[w] += 1
+            try:
+                for w in await early_buyers(session, cfg, mint):
+                    counter[w] += 1
+                done += 1
+            except FetchError as e:
+                failed.append(mint)
+                print(f"  ⚠️  {mint[:8]}: НЕ ОБРАБОТАН — {e}")
+
+    # Пустой файл поверх готового списка кандидатов — то же самое, что было
+    # в анализаторе: обрыв связи выглядит как «никого не нашлось».
+    if not done:
+        raise SystemExit(
+            f"\nНи один минт не обработан — данные не получены "
+            f"({len(failed)} из {len(mints)}).\n"
+            f"{out} не тронут. Причину покажет: python doctor.py")
 
     # кошельки, попавшие рано сразу в НЕСКОЛЬКО удачных токенов, ценнее всего:
     # один хит — это лотерея, три хита — уже похоже на систему
@@ -109,7 +129,14 @@ async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
         f.write("# кандидаты. Обязательно прогнать через wallet_analyzer.py\n")
         for w in picked:
             f.write(f"{w}  # ранних входов: {counter[w]}\n")
-    print(f"\n{len(picked)} кандидатов (>= {min_hits} попаданий) → {out}")
+    print(f"\n{len(picked)} кандидатов (>= {min_hits} попаданий) из {done} минтов → {out}")
+    if failed:
+        print(f"⚠️  Не обработано минтов: {len(failed)} — данные не получены. "
+              f"Это не значит, что там нет ранних покупателей.")
+    if min_hits > done:
+        # порог выше числа успешно обработанных минтов физически недостижим
+        print(f"⚠️  --min-hits {min_hits} больше, чем обработано минтов ({done}): "
+              f"пройти этот порог не может никто. Добавь минтов или снизь порог.")
 
 
 def main() -> None:
