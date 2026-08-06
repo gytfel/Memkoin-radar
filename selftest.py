@@ -14,8 +14,10 @@ import os
 import shutil
 import tempfile
 import time
+from html.parser import HTMLParser
 
 import radar_bot
+import token_safety
 import wallet_analyzer as wa
 from signal_journal import SignalJournal
 from wallet_analyzer import (Swap, compute_metrics, load_config, parse_swap,
@@ -167,5 +169,109 @@ radar._remember_buy("GONE", "A", 1.0, now - window - 600)
 radar._confluence("GONE")
 assert "GONE" not in radar.buys, "минты без свежих покупок текут в памяти"
 print("   пустые минты вычищаются из памяти")
+
+
+# --- 8. команды бота -------------------------------------------------------- #
+print(f"\n{'='*74}\nКоманды\n{'-'*74}")
+
+
+class _FakeTG(radar_bot.Telegram):
+    """Телеграм без сети: команды проверяются целиком, до текста ответа."""
+
+    def __init__(self, chat: str, updates: list):
+        self.chat_id, self._u, self.sent = chat, updates, []
+
+    async def poll(self):
+        u, self._u = self._u, []
+        return u
+
+    async def send(self, text, chat_id=None):
+        self.sent.append(text)
+        return True
+
+
+class _Markup(HTMLParser):
+    """Telegram отвечает 400 на кривую разметку, и сообщение теряется молча."""
+
+    ALLOWED = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+               "a", "code", "pre", "tg-spoiler", "blockquote", "span", "br"}
+
+    def __init__(self):
+        super().__init__()
+        self.stack, self.bad = [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.ALLOWED:
+            self.bad.append(f"недопустимый тег <{tag}>")
+        else:
+            self.stack.append(tag)
+
+    def handle_endtag(self, tag):
+        if not self.stack or self.stack[-1] != tag:
+            self.bad.append(f"</{tag}> не на своём месте")
+        else:
+            self.stack.pop()
+
+
+async def _fake_price(session, mint):
+    return 0.00000123
+
+
+_CHAT = "424242"
+_journal = SignalJournal(os.path.join(tempfile.mkdtemp(), "cmd.db"))
+_open = _journal.open_signal("M" * 44, "<b>ЗЛОЙ</b>", "w2|liqL|new",
+                             1e-6, 7.5e-7, [1.4e-6], True, {})
+_journal.update_peak(_open, 1.8e-6)
+_done = _journal.open_signal("N" * 44, "TOK", "w2|liqL|new", 1e-3, 7.5e-4, [1.4e-3], True, {})
+_journal.resolve(_done, "win", 1.4e-3)
+
+_bot = radar_bot.Radar(CFG, ["W" * 44], _journal)
+_bot._remember_buy("WATCH" + "1" * 39, "A", 2.5, int(time.time()))
+token_safety.price_usd = _fake_price
+
+
+def _ask(text: str, chat: str = _CHAT) -> list[str]:
+    tg = _FakeTG(_CHAT, [{"update_id": 1,
+                          "message": {"text": text, "chat": {"id": int(chat)}}}])
+    asyncio.run(_bot.handle_commands(None, tg))
+    return tg.sent
+
+
+for _cmd, _desc, _grp in radar_bot.COMMANDS:
+    _out = _ask(f"/{_cmd}")
+    assert _out, f"/{_cmd} не ответила"
+    assert "Не знаю команду" not in _out[0], f"/{_cmd} есть в меню, но не в роутере"
+    for _msg in _out:
+        _p = _Markup()
+        _p.feed(_msg)
+        _p.close()
+        assert not _p.bad and not _p.stack, f"/{_cmd}: битая разметка {_p.bad or _p.stack}"
+print(f"   все {len(radar_bot.COMMANDS)} команд меню отвечают валидным HTML")
+
+assert "&lt;b&gt;ЗЛОЙ&lt;/b&gt;" in _ask("/open")[0], "тикер утёк в разметку"
+print("   тикер вида <b>ЗЛОЙ</b> экранируется и в /open")
+
+assert _ask("/stats", chat="999999") == [], "команда из чужого чата получила ответ"
+print("   команда из чужого чата остаётся без ответа")
+
+assert "Открытых" in _ask("/open@my_bot")[0], "имя бота в команде не распознано"
+print("   /open@my_bot распознаётся как /open")
+
+
+async def _boom(session, tg, chat):
+    raise RuntimeError("тестовый сбой")
+
+
+_bot.cmd_status, _saved = _boom, _bot.cmd_status
+assert "сорвалась" in _ask("/status")[0], "падение команды не поймано"
+_bot.cmd_status = _saved
+print("   упавшая команда не роняет цикл, а отвечает в чат")
+
+_bot.muted = True
+assert _bot.muted and "resume" in _ask("/status")[0], "пауза не видна в /status"
+_bot.muted = False
+print("   /pause виден в /status и снимается через /resume")
+
+_journal.close()
 
 print(f"\n{'='*74}\nВсе проверки логики пройдены.\n{'='*74}")

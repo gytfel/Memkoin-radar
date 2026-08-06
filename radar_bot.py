@@ -11,7 +11,10 @@ radar_bot.py — телеграм-радар.
   5. Отправленные сигналы ведёт до конца: TP-лестница, стоп, выход
      tracked-кошельков — всё приходит в тот же чат.
 
-Команды в боте: /stats  /open  /wallets  /help
+Команды сгруппированы по назначению (полный список — в COMMANDS ниже):
+  что происходит  — /status  /open  /watch
+  результаты      — /stats   /history
+  настройки       — /wallets /settings /pause /resume
 
 Запуск:
     python radar_bot.py --wallets qualified.json
@@ -38,7 +41,42 @@ from wallet_analyzer import (fetch_swaps, get_json, load_config,
 TG = "https://api.telegram.org/bot{token}/{method}"
 TG_LIMIT = 4096          # жёсткий лимит длины сообщения в Telegram
 
+# Длинные списки режутся: в чате нужен обзор, а не выгрузка базы.
+OPEN_LIMIT, WATCH_LIMIT, HISTORY_LIMIT, WALLET_LIMIT = 10, 10, 10, 20
+
+# Команды сгруппированы по назначению: «что сейчас», «что уже случилось»,
+# «как бот настроен». Раньше их было три штуки без всякого деления, и
+# добрая половина состояния радара из чата просто не читалась.
+COMMANDS = [
+    ("status",   "жив ли радар и что он видит сейчас",  "Что происходит"),
+    ("open",     "открытые сигналы с текущей ценой",    "Что происходит"),
+    ("watch",    "токены на подходе к сигналу",         "Что происходит"),
+    ("stats",    "замеренный winrate по условиям",      "Результаты"),
+    ("history",  "последние закрытые сигналы",          "Результаты"),
+    ("wallets",  "за какими кошельками слежу",          "Настройки"),
+    ("settings", "пороги входа, риска и безопасности",  "Настройки"),
+    ("pause",    "перестать присылать сигналы",         "Настройки"),
+    ("resume",   "вернуть сигналы",                     "Настройки"),
+    ("help",     "этот список",                         "Справка"),
+]
+
 log = logging.getLogger("radar")
+
+
+def help_text() -> str:
+    """Справка собирается из COMMANDS, а не пишется отдельно.
+
+    Раньше список в /help жил своей жизнью и отставал от кода: команда
+    существовала, а в справке её не было.
+    """
+    lines: list[str] = []
+    group = None
+    for cmd, desc, grp in COMMANDS:
+        if grp != group:
+            lines.append(f"\n<b>{grp}</b>")
+            group = grp
+        lines.append(f"/{cmd} — {desc}")
+    return "\n".join(lines).strip()
 
 
 def esc(value) -> str:
@@ -93,6 +131,17 @@ class Telegram:
                 ok = False
         return ok
 
+    async def register_commands(self) -> bool:
+        """Отдаём список команд в меню Telegram.
+
+        Без этого кнопка меню в клиенте пустая, и команды знает только тот,
+        кто читал README. Половина возможностей бота так и остаётся ненайденной.
+        """
+        res = await post_json(
+            self.s, TG.format(token=self.token, method="setMyCommands"),
+            {"commands": [{"command": c, "description": d} for c, d, _ in COMMANDS]})
+        return res is not None
+
     async def poll(self) -> list[dict]:
         data = await get_json(self.s, TG.format(token=self.token, method="getUpdates"),
                               {"offset": self.offset, "timeout": 0}, retries=1)
@@ -119,6 +168,9 @@ class Radar:
         self.buys: dict[str, deque] = {}
         self.started = int(time.time())
         self.checked = 0
+        # /pause глушит только доставку. Радар продолжает вести журнал,
+        # иначе пауза рвала бы замер winrate — ровно то, ради чего он есть.
+        self.muted = False
 
     # ---------------------------------------------------------------- #
     def _prune(self, mint: str) -> deque:
@@ -212,7 +264,7 @@ class Radar:
         allowed, gate_note = self.j.gate(bucket, rk["target_hit_rate"],
                                          rk["min_sample_for_gate"])
         hard = self.cfg["risk"]["gate_mode"] == "hard"
-        deliver = allowed or not hard
+        deliver = (allowed or not hard) and not self.muted
 
         sid = self.j.open_signal(
             mint, safety.symbol, bucket, entry, sl, tps, deliver,
@@ -314,10 +366,20 @@ class Radar:
                               f"движения к цели ({chg:+.1f}%). Закрываю по времени.")
 
     # ---------------------------------------------------------------- #
-    async def handle_commands(self, tg: Telegram) -> None:
+    #  команды
+    # ---------------------------------------------------------------- #
+    async def handle_commands(self, session, tg: Telegram) -> None:
+        router = {
+            "start": self.cmd_start, "help": self.cmd_help,
+            "status": self.cmd_status, "open": self.cmd_open,
+            "watch": self.cmd_watch, "stats": self.cmd_stats,
+            "history": self.cmd_history, "wallets": self.cmd_wallets,
+            "settings": self.cmd_settings,
+            "pause": self.cmd_pause, "resume": self.cmd_resume,
+        }
         for u in await tg.poll():
             msg = u.get("message") or u.get("channel_post") or {}
-            text = (msg.get("text") or "").strip().lower()
+            text = (msg.get("text") or "").strip()
             chat = str((msg.get("chat") or {}).get("id") or "")
             if not text.startswith("/"):
                 continue
@@ -328,25 +390,170 @@ class Radar:
                 log.warning("Команда %r из чужого чата %s — игнорирую", text, chat)
                 continue
 
-            if text.startswith("/stats"):
-                await tg.send("📊 <b>Реальная статистика радара</b>\n<pre>"
-                              + esc(self.j.summary()) + "</pre>", chat)
-            elif text.startswith("/open"):
-                rows = self.j.list_open()
-                if not rows:
-                    await tg.send("Открытых сигналов нет.", chat)
-                else:
-                    await tg.send("\n".join(
-                        f"#{s.id} {esc(s.symbol)} вход ${s.entry_price:.8f} "
-                        f"пик ${s.peak_price:.8f}" for s in rows), chat)
-            elif text.startswith("/wallets"):
-                up = (time.time() - self.started) / 3600
-                await tg.send(f"Отслеживаю {len(self.wallets)} кошельков.\n"
-                              f"Аптайм: {up:.1f} ч · проверено кандидатов: {self.checked}",
-                              chat)
+            # "/open@my_bot что-то" -> "open". В группах Telegram сам дописывает
+            # имя бота, и сравнение по целой строке такую команду не узнавало.
+            cmd = text.split()[0][1:].split("@")[0].lower()
+            handler = router.get(cmd)
+            if handler is None:
+                await tg.send(f"Не знаю команду /{esc(cmd)}.\n\n" + help_text(), chat)
+                continue
+            try:
+                await handler(session, tg, chat)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:                              # noqa: BLE001
+                # Одна кривая команда не должна ронять итерацию радара:
+                # иначе из-за /open с битой строкой в БД встал бы весь скан.
+                log.error("Команда /%s не отработала: %s: %s", cmd, type(e).__name__, e)
+                log.debug("traceback", exc_info=True)
+                await tg.send(f"Команда /{esc(cmd)} сорвалась: "
+                              f"{esc(type(e).__name__)}. Подробности в логе.", chat)
+
+    # ---- справка ---------------------------------------------------- #
+    async def cmd_start(self, session, tg: Telegram, chat: str) -> None:
+        r = self.cfg["radar"]
+        await tg.send(
+            "🛰 <b>Memkoin Radar</b>\n\n"
+            "Слежу за кошельками в Solana и пишу, когда несколько из них "
+            "заходят в один токен одновременно.\n\n"
+            f"Под наблюдением <b>{len(self.wallets)}</b> кошельков, "
+            f"проверка каждые {r['poll_interval_sec']} с.\n\n"
+            "Это следование за умными деньгами, а не предсказание роста: "
+            "сигнал приходит <i>после</i> того, как они зашли. Решение за тобой.\n\n"
+            + help_text(), chat)
+
+    async def cmd_help(self, session, tg: Telegram, chat: str) -> None:
+        await tg.send(help_text(), chat)
+
+    # ---- что происходит --------------------------------------------- #
+    async def cmd_status(self, session, tg: Telegram, chat: str) -> None:
+        up = (time.time() - self.started) / 3600
+        wr, n = self.j.hit_rate()
+        rk = self.cfg["risk"]
+        await tg.send(
+            "📡 <b>Состояние радара</b>\n\n"
+            f"Аптайм: <b>{up:.1f} ч</b>\n"
+            f"Кошельков: <b>{len(self.wallets)}</b>\n"
+            f"Проверено кандидатов: <b>{self.checked}</b>\n"
+            f"Токенов копится в окне: <b>{len(self.buys)}</b>\n"
+            f"Открытых сигналов: <b>{len(self.j.list_open())}</b>\n"
+            f"Закрытых исходов: <b>{n}</b>"
+            + (f" · winrate {wr*100:.0f}%" if n else " — статистики ещё нет") + "\n"
+            f"Гейт: <b>{esc(rk['gate_mode'])}</b>, цель {rk['target_hit_rate']*100:.0f}%\n"
+            f"Сигналы: <b>{'приглушены — /resume' if self.muted else 'включены'}</b>",
+            chat)
+
+    async def cmd_open(self, session, tg: Telegram, chat: str) -> None:
+        rows = self.j.list_open()
+        if not rows:
+            await tg.send("Открытых сигналов нет.", chat)
+            return
+        lines = [f"📂 <b>Открытых сигналов: {len(rows)}</b>"]
+        for s in rows[:OPEN_LIMIT]:
+            price = await ts.price_usd(session, s.mint)
+            age_h = (time.time() - s.ts) / 3600
+            if price > 0 and s.entry_price > 0:
+                now = f"${price:.8f} ({(price / s.entry_price - 1) * 100:+.1f}%)"
             else:
-                await tg.send("/stats — замеренный winrate\n/open — открытые сигналы\n"
-                              "/wallets — что отслеживаю", chat)
+                now = "цена недоступна"
+            peak = (s.peak_price / s.entry_price - 1) * 100 if s.entry_price > 0 else 0.0
+            lines.append(
+                f"\n<b>#{s.id} {esc(s.symbol)}</b> · {age_h:.1f} ч в позиции\n"
+                f"вход ${s.entry_price:.8f} → {now}\n"
+                f"пик {peak:+.0f}% · стоп ${s.sl_price:.8f}")
+        if len(rows) > OPEN_LIMIT:
+            lines.append(f"\n…и ещё {len(rows) - OPEN_LIMIT}")
+        await tg.send("\n".join(lines), chat)
+
+    async def cmd_watch(self, session, tg: Telegram, chat: str) -> None:
+        """Что набирает конфлюэнс, но сигналом ещё не стало.
+
+        Самая частая претензия к такому боту — «он молчит, он сломан».
+        Здесь видно, что он считает прямо сейчас.
+        """
+        r = self.cfg["radar"]
+        need_n, need_sol = r["confluence_wallets"], r["min_combined_buy_sol"]
+        rows = []
+        for mint in list(self.buys):
+            n, sol, _ = self._confluence(mint)
+            if n:
+                rows.append((n, sol, mint))
+        if not rows:
+            await tg.send(
+                "Пока пусто: ни один токен не набирает конфлюэнс.\n\n"
+                f"Для сигнала нужно <b>{need_n}+</b> разных кошельков и "
+                f"<b>{need_sol}+</b> SOL за {r['confluence_window_min']} мин.\n"
+                "Это нормальное состояние: такие совпадения редки.", chat)
+            return
+        rows.sort(reverse=True)
+        lines = [f"👀 <b>На подходе</b> (нужно {need_n} кошельков и {need_sol} SOL)"]
+        for n, sol, mint in rows[:WATCH_LIMIT]:
+            mark = "🔥" if n >= need_n and sol >= need_sol else "·"
+            lines.append(f"{mark} <code>{esc(mint[:8])}…{esc(mint[-4:])}</code> — "
+                         f"{n} кош. · {sol:.2f} SOL")
+        if len(rows) > WATCH_LIMIT:
+            lines.append(f"…и ещё {len(rows) - WATCH_LIMIT}")
+        await tg.send("\n".join(lines), chat)
+
+    # ---- результаты -------------------------------------------------- #
+    async def cmd_stats(self, session, tg: Telegram, chat: str) -> None:
+        await tg.send("📊 <b>Замеренная статистика</b>\n<pre>"
+                      + esc(self.j.summary()) + "</pre>", chat)
+
+    async def cmd_history(self, session, tg: Telegram, chat: str) -> None:
+        rows = self.j.list_closed(HISTORY_LIMIT)
+        if not rows:
+            await tg.send("Закрытых сигналов пока нет.", chat)
+            return
+        lines = [f"📜 <b>Последние закрытые: {len(rows)}</b>"]
+        for r in rows:
+            icon = "✅" if r["status"] == "win" else "🔴"
+            rm = f"{r['r_multiple']:+.2f}R" if r["r_multiple"] is not None else "—"
+            when = time.strftime("%d.%m %H:%M", time.localtime(r["exit_ts"] or 0))
+            lines.append(f"{icon} <b>#{r['id']} {esc(r['symbol'] or '?')}</b> · "
+                         f"{rm} · {when}")
+        lines.append("\nR — прибыль в размерах риска. +2R значит вдвое больше, "
+                     "чем стояло на стопе.")
+        await tg.send("\n".join(lines), chat)
+
+    # ---- настройки ---------------------------------------------------- #
+    async def cmd_wallets(self, session, tg: Telegram, chat: str) -> None:
+        lines = [f"👛 <b>Отслеживаю {len(self.wallets)} кошельков</b>\n"]
+        lines += [f"<code>{esc(w)}</code>" for w in self.wallets[:WALLET_LIMIT]]
+        if len(self.wallets) > WALLET_LIMIT:
+            lines.append(f"…и ещё {len(self.wallets) - WALLET_LIMIT}")
+        await tg.send("\n".join(lines), chat)
+
+    async def cmd_settings(self, session, tg: Telegram, chat: str) -> None:
+        r, s, rk = self.cfg["radar"], self.cfg["safety"], self.cfg["risk"]
+        ladder = " / ".join(f"+{p:g}%" for p in rk["take_profit_ladder_pct"])
+        await tg.send(
+            "⚙️ <b>Текущие пороги</b>\n\n"
+            "<b>Условие сигнала</b>\n"
+            f"кошельков: {r['confluence_wallets']}+ за {r['confluence_window_min']} мин\n"
+            f"объём покупок: {r['min_combined_buy_sol']}+ SOL\n"
+            f"повтор по токену: не чаще {r['cooldown_min']} мин\n\n"
+            "<b>Проверка токена</b>\n"
+            f"ликвидность: от ${s['min_liquidity_usd']:,}\n"
+            f"FDV: до ${s['max_fdv_usd']:,}\n"
+            f"топ-10 холдеров: до {s['max_top10_pct']}%\n\n"
+            "<b>Риск</b>\n"
+            f"стоп: −{rk['stop_loss_pct']:g}%\n"
+            f"тейки: {ladder}\n"
+            f"риск на сделку: {rk['risk_per_trade_pct']:g}% "
+            f"от {rk['account_size_sol']:g} SOL\n\n"
+            "Правятся в config.yaml, после правки нужен перезапуск.", chat)
+
+    async def cmd_pause(self, session, tg: Telegram, chat: str) -> None:
+        self.muted = True
+        await tg.send("🔇 Сигналы приглушены.\n\n"
+                      "Радар продолжает работать и писать сигналы в журнал — "
+                      "замер winrate не прервётся, вы просто их не увидите.\n"
+                      "Вернуть: /resume", chat)
+
+    async def cmd_resume(self, session, tg: Telegram, chat: str) -> None:
+        self.muted = False
+        await tg.send("🔔 Сигналы снова приходят.", chat)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,6 +573,10 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
             log.info("Радар запущен: кошельков %d, опрос каждые %d с, чат %s",
                      len(wallets), cfg["radar"]["poll_interval_sec"], tg.chat_id)
 
+            if not await tg.register_commands():
+                log.warning("Меню команд не зарегистрировалось — команды всё равно "
+                            "работают, просто их не будет в списке у кнопки меню.")
+
             if await tg.send(
                     f"🛰 Радар запущен.\nКошельков: {len(wallets)}\n"
                     f"Условие сигнала: {cfg['radar']['confluence_wallets']}+ кошелька, "
@@ -384,7 +595,7 @@ async def main_loop(cfg: dict, wallets: list[str], db: str):
 
             while True:
                 try:
-                    await radar.handle_commands(tg)
+                    await radar.handle_commands(session, tg)
                     await radar.scan_wallets(session, tg)
                     await radar.monitor_open(session, tg)
                     tick += 1

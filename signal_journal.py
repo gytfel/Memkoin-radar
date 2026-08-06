@@ -126,6 +126,17 @@ class SignalJournal:
                                   bool(r["delivered"])))
         return out
 
+    def list_closed(self, limit: int = 10) -> list[sqlite3.Row]:
+        """Последние отработавшие сигналы — для /history.
+
+        Только доставленные: подавленные гейтом человек не видел, и в
+        истории они выглядели бы сделками, которых у него не было.
+        """
+        return self.db.execute(
+            "SELECT id, symbol, status, r_multiple, exit_ts, entry_price, exit_price "
+            "FROM signals WHERE status IN ('win','loss') AND delivered=1 "
+            "ORDER BY COALESCE(exit_ts, ts) DESC LIMIT ?", (limit,)).fetchall()
+
     def update_peak(self, sid: int, price: float) -> None:
         # COALESCE: sqlite-шный MAX(a,b) возвращает NULL, если любой аргумент NULL
         self.db.execute(
