@@ -184,8 +184,12 @@ python selftest.py
 (dexscreener → сортировка по росту), и найди тех, кто входил рано:
 
 ```bash
-python discover.py --mint MINT1 --mint MINT2 --mint MINT3 --out candidates.txt
+python discover.py --mints mints.txt --out candidates.txt
 ```
+
+Минты складывайте в `mints.txt` по одному в строке (`#` — комментарий). Адреса
+проверяются перед запуском: опечатку RPC ошибкой не считает, он просто вернёт
+пустую историю, и токен молча выпал бы из подсчёта.
 
 `--min-hits 2` значит «попал рано минимум в 2 разных токена» — один хит это лотерея.
 

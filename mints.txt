@@ -1,0 +1,18 @@
+# Токены, которые уже отработали. По ним discover.py ищет тех, кто входил рано:
+#     python discover.py --mints mints.txt --out candidates.txt --min-hits 2
+#
+# Дальше кандидатов обязательно через фильтр:
+#     python wallet_analyzer.py --wallets candidates.txt --out qualified.json
+#
+# Чем свежее монета, тем лучше: у старых история длиннее, чем discover.py
+# успевает пролистать, и «ранние покупатели» окажутся не самыми ранними —
+# он об этом предупредит отдельной строкой.
+
+Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump
+7rMnp9EJd61SvNn8LGc7SAJeQxM36oeECKmP2a7opump
+EygStH4gHv1h4E8w4raYv6NGsrDiij3nbfCc26iTpump
+R6xLr8zbvxdb8m4NRg8fnPeEbiKFbSPaHTAG5MApump
+6a4TCQoCFXXNK8jUtjCMPqvoaLGx1oNLrciBiRafpump
+vKMkWJhhRfG7Yh82AqESD3PxTraZNZueTsnKRtspump
+14doqPq3fLzx6kB4JRRnCMDPPLeGmGXd6QY5ZGXqpump
+AA3VLt3muGJiXedDaMnkcst3pfjrg1JBxgHVSdSbpump
