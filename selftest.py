@@ -136,21 +136,63 @@ shutil.rmtree(tmp, ignore_errors=True)
 print(f"\n{'='*74}\nРегрессии\n{'-'*74}")
 
 
-async def _helius_error_page():
-    """Helius на ошибке отдаёт 200 + словарь: fetch_swaps падал с AttributeError."""
-    real, wa.get_json = wa.get_json, lambda *a, **k: _dict_payload()
+def _with_payload(payloads: list):
+    """Подменяем get_json заранее заданными ответами Helius."""
+    seq = list(payloads)
+
+    async def fake(*a, **k):
+        return seq.pop(0) if seq else None
+    return fake
+
+
+def _fetch(payloads: list, pages: int = 1):
+    real, wa.get_json = wa.get_json, _with_payload(payloads)
     try:
-        return await wa.fetch_swaps(None, "W", CFG, pages=1)
+        return asyncio.run(wa.fetch_swaps(None, "W", CFG, pages=pages))
     finally:
         wa.get_json = real
 
 
-async def _dict_payload():
-    return {"error": "Invalid API key"}
+# «Не получили данные» и «данных нет» — разные вещи. Пока они выглядели
+# одинаково (пустой список), анализатор выносил вердикт «сделок 0,
+# отклонён» по нулю данных и затирал этим qualified.json.
+for _payload, _case in (({"error": "Invalid API key"}, "неверный ключ"),
+                        (None, "сеть не ответила")):
+    try:
+        _fetch([_payload])
+    except wa.FetchError:
+        print(f"   первая страница, {_case} → FetchError, а не пустой список")
+    else:
+        raise AssertionError(f"{_case}: fetch_swaps смолчал вместо ошибки")
+
+# Пустой ответ — это законное «свопов нет», не ошибка.
+assert _fetch([[]]) == [], "пустая история принята за сбой"
+print("   пустая история кошелька остаётся пустым списком без ошибки")
+
+# Обрыв на второй странице не должен выбрасывать уже полученное.
+_page1 = [{"timestamp": T0, "signature": "s1", "events": {"swap": {
+    "nativeInput": {"account": "W", "amount": "1000000000"},
+    "tokenOutputs": [{"userAccount": "W", "mint": "M",
+                      "rawTokenAmount": {"tokenAmount": "1000000", "decimals": 6}}]}}}]
+_got = _fetch([_page1 * CFG["analyzer"]["page_limit"], None], pages=3)
+assert len(_got) == CFG["analyzer"]["page_limit"], f"частичная история потеряна: {len(_got)}"
+print(f"   обрыв на второй странице сохраняет уже собранное: {len(_got)} свопов")
 
 
-assert asyncio.run(_helius_error_page()) == [], "fetch_swaps не пережил ошибку Helius"
-print("   fetch_swaps на ошибочном ответе Helius → [] без исключения")
+# радар не должен падать, когда кошелёк не отвечает
+async def _scan_with_failure():
+    real, wa.get_json = wa.get_json, _with_payload([None])
+    radar_bot.fetch_swaps = wa.fetch_swaps
+    try:
+        r = radar_bot.Radar(CFG, ["W" * 44], None)
+        await r.scan_wallets(None, None)
+        return True
+    finally:
+        wa.get_json = real
+
+
+assert asyncio.run(_scan_with_failure()), "радар упал на недоступном кошельке"
+print("   радар переживает недоступный кошелёк и продолжает обход")
 
 # адрес из candidates.txt идёт до комментария discover.py
 cand = os.path.join(tempfile.mkdtemp(), "candidates.txt")

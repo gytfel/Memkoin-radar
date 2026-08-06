@@ -33,6 +33,14 @@ log = logging.getLogger("radar")
 
 HELIUS_TX = "https://api.helius.xyz/v0/addresses/{addr}/transactions"
 
+
+class FetchError(RuntimeError):
+    """Данные не получены — это не то же самое, что «данных нет».
+
+    Разница принципиальная: по «нет данных» выносится вердикт, по «не
+    получили» выносить нечего. Раньше оба случая выглядели пустым списком.
+    """
+
 WSOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
@@ -381,14 +389,25 @@ async def fetch_swaps(session, wallet: str, cfg: dict, pages: int | None = None,
     url = HELIUS_TX.format(addr=wallet)
     before, out = None, []
 
-    for _ in range(max(1, pages)):
+    for page in range(max(1, pages)):
         params = {"api-key": key, "limit": limit, "type": "SWAP"}
         if before:
             params["before"] = before
         data = await get_json(session, url, params)
 
-        # Helius на ошибке отдаёт 200 + {"error": ...}: без этой проверки
-        # цикл ниже итерировался по ключам словаря и падал с AttributeError.
+        # Первая страница особая: если её не получили, про кошелёк не известно
+        # НИЧЕГО. Раньше здесь возвращался пустой список — неотличимый от
+        # «кошелёк не торговал», и анализатор выносил уверенный вердикт
+        # «сделок 0, отклонён» по нулю данных. Неверный ключ Helius давал
+        # ровно ту же картину.
+        if page == 0 and data is None:
+            raise FetchError(f"Helius не ответил по {wallet[:8]}")
+        if page == 0 and isinstance(data, dict):
+            raise FetchError(f"Helius отклонил запрос по {wallet[:8]}: "
+                             f"{data.get('error') or data}")
+
+        # Обрыв на середине истории — не то же самое: часть данных уже есть,
+        # дальше просто нечего листать.
         if isinstance(data, dict):
             log.warning("Helius вернул ошибку для %s: %s",
                         wallet[:8], data.get("error") or data)
@@ -652,12 +671,20 @@ async def analyze_wallet(session, wallet: str, cfg: dict) -> WalletMetrics:
 async def run(wallets: list[str], cfg: dict, out_path: str):
     sem = asyncio.Semaphore(cfg["analyzer"]["concurrency"])
     results: list[WalletMetrics] = []
+    unchecked: list[str] = []
 
     async with make_session() as session:
         async def worker(w: str):
             async with sem:
                 try:
                     m = await analyze_wallet(session, w, cfg)
+                except FetchError as e:
+                    # Вердикт по кошельку, о котором ничего не известно, —
+                    # это дезинформация: выглядит как «плохой кошелёк».
+                    unchecked.append(w)
+                    log.warning("Кошелёк %s не проверен: %s", w[:8], e)
+                    print(f"⚠️  {w[:6]}..{w[-4:]}  НЕ ПРОВЕРЕН: {e}")
+                    return
                 except Exception as e:                      # noqa: BLE001
                     log.warning("Кошелёк %s не проанализирован: %s: %s",
                                 w[:8], type(e).__name__, e)
@@ -674,15 +701,29 @@ async def run(wallets: list[str], cfg: dict, out_path: str):
 
         await asyncio.gather(*(worker(w) for w in wallets))
 
+    # Пустой результат по нулю данных нельзя записывать в файл: он затрёт
+    # рабочий qualified.json, и радар останется без кошельков из-за обрыва
+    # связи, а не из-за качества кошельков.
+    if not results:
+        raise SystemExit(
+            f"\nНи один кошелёк не проверен — данные не получены "
+            f"({len(unchecked)} из {len(wallets)}).\n"
+            f"{out_path} не тронут: пустой список затёр бы рабочий.\n"
+            f"Причину покажет: python doctor.py")
+
     results.sort(key=lambda m: m.score, reverse=True)
     good = [m for m in results if qualifies(m, cfg["analyzer"])[0]]
 
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"generated_at": int(time.time()),
                    "qualified": [asdict(m) for m in good],
-                   "all": [asdict(m) for m in results]}, f, indent=2, ensure_ascii=False)
+                   "all": [asdict(m) for m in results],
+                   "unchecked": unchecked}, f, indent=2, ensure_ascii=False)
 
-    print(f"\nГодных кошельков: {len(good)} из {len(results)} → {out_path}")
+    print(f"\nГодных кошельков: {len(good)} из {len(results)} проверенных → {out_path}")
+    if unchecked:
+        print(f"⚠️  Не проверено {len(unchecked)} из {len(wallets)}: данные не "
+              f"получены. Это не вердикт — прогони заново, когда сеть вернётся.")
     if not good:
         print("Это нормальный результат. Большинство «топовых» кошельков "
               "не проходят фильтр на expectancy и на скрытые мешки.")
