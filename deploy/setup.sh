@@ -68,8 +68,10 @@ if [ "${NEED_KEYS:-0}" = "1" ]; then
 else
     echo "Код обновлён, .env не тронут. Проверить и перезапустить:"
 fi
-echo "    cd $APP_DIR && sudo -u radar .venv/bin/python doctor.py"
-echo "    systemctl enable --now $SERVICE"
+echo "    cd $APP_DIR && sudo bash pipeline.sh"
+echo
+echo "pipeline.sh делает всё сам: проверку связи, поиск кандидатов,"
+echo "фильтр кошельков и запуск сервиса."
 echo
 echo "Дальше пригодится:"
 echo "    systemctl status $SERVICE      # работает ли"
