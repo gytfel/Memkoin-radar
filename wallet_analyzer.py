@@ -750,6 +750,12 @@ def main():
                       if ln.strip() and not ln.lstrip().startswith("#")]
     addrs = [a for a in dict.fromkeys(addrs) if a]
     if not addrs:
+        # Раньше здесь было «Нужен --wallet или --wallets» на оба случая, и
+        # при пустом файле сообщение прямо врало: флаг-то был передан.
+        if args.wallets:
+            sys.exit(f"В {args.wallets} нет ни одного адреса — только комментарии "
+                     f"или пусто.\nЕсли файл собрал discover.py, значит ранних "
+                     f"покупателей найти не удалось: смотри его предупреждения.")
         sys.exit("Нужен --wallet или --wallets")
 
     asyncio.run(run(addrs, cfg, args.out))

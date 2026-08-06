@@ -26,9 +26,15 @@ HELIUS_PARSE = "https://api.helius.xyz/v0/transactions"
 log = logging.getLogger("radar")
 
 
-async def oldest_signatures(session, rpc: str, mint: str,
-                            max_pages: int = 25, page: int = 1000) -> list[str]:
-    """Листаем историю адреса минта до самого начала, возвращаем самые старые подписи."""
+async def oldest_signatures(session, rpc: str, mint: str, max_pages: int = 25,
+                            page: int = 1000) -> tuple[list[str], bool]:
+    """Листаем историю минта до начала. Возвращаем (подписи, дошли ли до конца).
+
+    Флаг важнее самих подписей: RPC умеет листать только назад от свежих,
+    поэтому если страниц не хватило, «самые старые» из полученных — это
+    просто граница, до которой успели дойти. Ранними покупателями такие
+    адреса не являются, и молча считать их за таковых нельзя.
+    """
     before, sigs = None, []
     exhausted = False
     for attempt in range(max_pages):
@@ -61,10 +67,10 @@ async def oldest_signatures(session, rpc: str, mint: str,
             break
         await asyncio.sleep(0.2)          # RPC-лимиты: 25 страниц подряд ловят 429
     if not exhausted:
-        # иначе «ранние покупатели» молча окажутся не самыми ранними
-        log.warning("%s: история длиннее %d стр. — до первых покупок не долистали, "
-                    "результат по этому минту неполный", mint[:8], max_pages)
-    return sigs[::-1]  # от старых к новым
+        log.warning("%s: история длиннее %d стр. — до первых покупок не долистали. "
+                    "Нужен --max-pages больше %d либо токен посвежее",
+                    mint[:8], max_pages, max_pages)
+    return sigs[::-1], exhausted  # от старых к новым
 
 
 async def parse_batch(session, key: str, sigs: list[str]) -> list[dict]:
@@ -80,14 +86,15 @@ async def parse_batch(session, key: str, sigs: list[str]) -> list[dict]:
     return out
 
 
-async def early_buyers(session, cfg: dict, mint: str, first_n: int = 400) -> list[str]:
+async def early_buyers(session, cfg: dict, mint: str, first_n: int = 400,
+                       max_pages: int = 25) -> tuple[list[str], bool]:
     rpc = cfg["rpc"]["rpc_url"]
     key = cfg["rpc"]["helius_api_key"]
 
-    sigs = await oldest_signatures(session, rpc, mint)
+    sigs, complete = await oldest_signatures(session, rpc, mint, max_pages)
     if not sigs:
         print(f"  {mint[:8]}: история не получена")
-        return []
+        return [], complete
 
     txs = await parse_batch(session, key, sigs[:first_n])
     buyers, seen = [], set()
@@ -99,26 +106,51 @@ async def early_buyers(session, cfg: dict, mint: str, first_n: int = 400) -> lis
         if swap and swap.mint == mint and swap.side == "buy":
             seen.add(payer)
             buyers.append(payer)
-    print(f"  {mint[:8]}: {len(buyers)} ранних покупателей из {len(txs)} tx")
-    return buyers
+    mark = "" if complete else "  (НЕ РАННИЕ: до начала истории не дошли)"
+    print(f"  {mint[:8]}: {len(buyers)} покупателей из {len(txs)} tx{mark}")
+    return buyers, complete
 
 
-async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
+async def run(mints: list[str], cfg: dict, out: str, min_hits: int,
+              max_pages: int = 25, allow_incomplete: bool = False):
     counter: Counter[str] = Counter()
-    done, failed = 0, []
+    done, failed, partial = 0, [], []
     async with make_session() as session:
         for mint in mints:
             try:
-                for w in await early_buyers(session, cfg, mint):
-                    counter[w] += 1
-                done += 1
+                buyers, complete = await early_buyers(session, cfg, mint,
+                                                      max_pages=max_pages)
             except FetchError as e:
                 failed.append(mint)
                 print(f"  ⚠️  {mint[:8]}: НЕ ОБРАБОТАН — {e}")
+                continue
+
+            if not complete:
+                partial.append(mint)
+                if not allow_incomplete:
+                    # Считать их за ранних — значит наполнить список кандидатов
+                    # случайными трейдерами и потом гонять их через анализатор
+                    # как будто это находка. --allow-incomplete снимает запрет.
+                    continue
+            for w in buyers:
+                counter[w] += 1
+            done += 1
 
     # Пустой файл поверх готового списка кандидатов — то же самое, что было
     # в анализаторе: обрыв связи выглядит как «никого не нашлось».
     if not done:
+        if partial and not failed:
+            raise SystemExit(
+                f"\nНи по одному минту не дошли до начала истории "
+                f"({len(partial)} из {len(mints)}).\n"
+                f"Найденные адреса ранними покупателями не являются, поэтому "
+                f"в зачёт не пошли и {out} не тронут.\n\n"
+                f"Что делать:\n"
+                f"  1) взять токены посвежее — у них история короче;\n"
+                f"  2) листать глубже: --max-pages {max_pages * 8} "
+                f"(дольше в {max_pages * 8 // max_pages} раз);\n"
+                f"  3) --allow-incomplete — считать что есть, понимая, что это "
+                f"не ранние покупатели.")
         raise SystemExit(
             f"\nНи один минт не обработан — данные не получены "
             f"({len(failed)} из {len(mints)}).\n"
@@ -135,6 +167,11 @@ async def run(mints: list[str], cfg: dict, out: str, min_hits: int):
     if failed:
         print(f"⚠️  Не обработано минтов: {len(failed)} — данные не получены. "
               f"Это не значит, что там нет ранних покупателей.")
+    if partial:
+        state = "учтены как есть" if allow_incomplete else "в зачёт не пошли"
+        print(f"⚠️  Не долистали до начала истории: {len(partial)} из {len(mints)} "
+              f"({state}). Помогут --max-pages больше {max_pages} или токены "
+              f"посвежее.")
     if min_hits > done:
         # порог выше числа успешно обработанных минтов физически недостижим
         print(f"⚠️  --min-hits {min_hits} больше, чем обработано минтов ({done}): "
@@ -155,6 +192,12 @@ def main() -> None:
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--out", default="candidates.txt")
     p.add_argument("--min-hits", type=int, default=2)
+    p.add_argument("--max-pages", type=int, default=25,
+                   help="сколько страниц истории листать на минт (1000 tx на "
+                        "страницу). Больше — дольше, но добирается до начала")
+    p.add_argument("--allow-incomplete", action="store_true",
+                   help="считать покупателей и там, где до начала истории не "
+                        "дошли (это НЕ ранние покупатели)")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args()
 
@@ -183,8 +226,9 @@ def main() -> None:
 
     cfg = load_config(a.config)
     require_config(cfg, "rpc.helius_api_key", "rpc.rpc_url")
-    print(f"Минтов на разбор: {len(mints)}, порог попаданий: {a.min_hits}")
-    asyncio.run(run(mints, cfg, a.out, a.min_hits))
+    print(f"Минтов на разбор: {len(mints)}, порог попаданий: {a.min_hits}, "
+          f"глубина: {a.max_pages} стр.")
+    asyncio.run(run(mints, cfg, a.out, a.min_hits, a.max_pages, a.allow_incomplete))
 
 
 if __name__ == "__main__":
