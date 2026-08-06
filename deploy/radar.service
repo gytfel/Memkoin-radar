@@ -12,7 +12,11 @@ Type=simple
 User=radar
 Group=radar
 WorkingDirectory=/opt/memkoin-radar
-ExecStart=/opt/memkoin-radar/.venv/bin/python radar_bot.py --wallets wallets.txt
+# Список кошельков не прибит здесь намеренно: он меняется по ходу работы
+# (wallets.txt → qualified.json), а правка юнита терялась бы при каждом
+# обновлении — setup.sh ставит его заново из репозитория. Источник задаётся
+# ключом WALLETS в /opt/memkoin-radar/.env
+ExecStart=/opt/memkoin-radar/.venv/bin/python radar_bot.py
 
 # Радар должен пережить всё: обрыв сети, сбой Helius, падение процесса.
 # Ради этого он и переезжал на сервер.

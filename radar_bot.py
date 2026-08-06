@@ -27,6 +27,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import time
 from collections import deque
 
@@ -653,8 +654,9 @@ async def main_loop(cfg: dict, wallets: list[str], db: str,
             # логи были уровня WARNING, а сетевая ошибка всплывает только
             # через четыре ретрая с бэкоффом. Со стороны — намертво зависший
             # процесс, хотя он просто ждёт ответа.
-            log.info("Радар запущен: кошельков %d, опрос каждые %d с, чат %s",
-                     len(wallets), cfg["radar"]["poll_interval_sec"], tg.chat_id)
+            log.info("Радар запущен: кошельков %d из %s, опрос каждые %d с, чат %s",
+                     len(wallets), wallets_path or "?",
+                     cfg["radar"]["poll_interval_sec"], tg.chat_id)
 
             if not await tg.register_commands():
                 log.warning("Меню команд не зарегистрировалось — команды всё равно "
@@ -716,7 +718,10 @@ def load_wallets(path: str) -> list[str]:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--wallets", default="qualified.json")
+    # Без значения по умолчанию: источник может прийти из WALLETS в .env,
+    # и разобрать это можно только после того, как .env прочитан.
+    p.add_argument("--wallets", default=None,
+                   help="файл со списком кошельков (или WALLETS в .env)")
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--db", default="signals.db")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -729,10 +734,16 @@ def main() -> None:
     # логов: в --log-file не попадала как раз самая нужная строка — почему
     # радар не взлетел. Для запуска двойным кликом это означало пустой файл.
     try:
-        conf = load_config(args.config)
+        conf = load_config(args.config)          # заодно читает .env в окружение
         require_config(conf, "telegram.bot_token", "telegram.chat_id",
                        "rpc.helius_api_key")
-        ws = load_wallets(args.wallets)
+
+        # Источник кошельков меняется по ходу работы: сперва wallets.txt,
+        # после анализатора — qualified.json. В systemd-юните это было
+        # прибито гвоздями, а правка юнита терялась при обновлении, потому
+        # что setup.sh ставит его заново из репозитория.
+        wallets_path = args.wallets or os.environ.get("WALLETS") or "qualified.json"
+        ws = load_wallets(wallets_path)
         if not ws:
             raise SystemExit("Список кошельков пуст. Сначала прогони "
                              "wallet_analyzer.py — радар без проверенных "
@@ -745,7 +756,7 @@ def main() -> None:
         raise SystemExit(1) from e
 
     try:
-        asyncio.run(main_loop(conf, ws, args.db, args.wallets))
+        asyncio.run(main_loop(conf, ws, args.db, wallets_path))
     except KeyboardInterrupt:
         log.info("Остановлено вручную.")
 

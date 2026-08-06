@@ -213,6 +213,15 @@ python wallet_analyzer.py --wallets candidates.txt --out qualified.json
 python radar_bot.py --wallets qualified.json
 ```
 
+Источник кошельков можно не указывать в команде — он берётся из `WALLETS`
+в `.env`. Это важно на сервере: в systemd-юните путь не прибит, потому что
+`setup.sh` ставит юнит заново при каждом обновлении и правку бы затёр.
+
+```
+WALLETS=wallets.txt      # сырой список, с него начинают
+WALLETS=qualified.json   # после wallet_analyzer.py
+```
+
 Или одной командой — она сама поставит зависимости, прогонит диагностику и
 поднимет радар: `sh run.sh` (Linux/macOS), двойной клик по `run.bat` (Windows).
 
