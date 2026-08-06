@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -107,10 +108,17 @@ print("   бакет условий:", bucket)
 for i in range(30):
     sid = j.open_signal("M", "TEST", bucket, 1.0, 0.75, [1.4], True, {})
     j.resolve(sid, "win" if i % 10 < 5 else "loss", 1.4 if i % 10 < 5 else 0.75)
-allowed, note = j.gate(bucket, CFG["risk"]["target_hit_rate"],
-                       CFG["risk"]["min_sample_for_gate"])
-print(f"   сигналы разрешены: {allowed}\n   {note}")
+# Цель задаём явно, а не берём из конфига: проверяется механизм гейта, и
+# он не должен зависеть от того, какая цифра сегодня стоит в config.yaml.
+# Раньше зависел — смена target_hit_rate на 0.45 роняла этот тест.
+SAMPLE = CFG["risk"]["min_sample_for_gate"]
+allowed, note = j.gate(bucket, 0.80, SAMPLE)
+print(f"   при цели 80%: разрешены = {allowed}\n   {note}")
 assert allowed is False, "гейт обязан глушить бакет с winrate ниже цели"
+
+allowed_low, note_low = j.gate(bucket, 0.45, SAMPLE)
+print(f"   при цели 45%: разрешены = {allowed_low}\n   {note_low}")
+assert allowed_low is True, "гейт обязан пропускать бакет с winrate выше цели"
 print("\n" + j.summary())
 
 # исход нельзя переписать задним числом
@@ -289,17 +297,27 @@ _tmp = tempfile.mkdtemp()
 def _cfg_with(profile: str) -> str:
     dst = os.path.join(_tmp, f"{profile}.yaml")
     with open(dst, "w", encoding="utf-8") as f:
-        f.write(_raw.replace("profile: balanced", f"profile: {profile}"))
+        # по регулярке, а не по конкретной строке: подстановка ломалась молча
+        # каждый раз, когда в config.yaml менялся выбранный профиль
+        f.write(re.sub(r"(?m)^profile:.*$", f"profile: {profile}", _raw, count=1))
     return dst
 
 
+_balanced = load_config(_cfg_with("balanced"))
 _strict = load_config(_cfg_with("strict"))
+assert _balanced["radar"]["confluence_wallets"] == 2, "balanced изменил базовые пороги"
 assert _strict["radar"]["confluence_wallets"] == 3, "профиль не наложился"
-assert _strict["risk"]["gate_mode"] == "hard", "strict не включил жёсткий гейт"
+assert _strict["safety"]["min_liquidity_usd"] > _balanced["safety"]["min_liquidity_usd"]
 # ключ, которого в профиле нет, должен уцелеть — иначе merge затирает базу
-assert _strict["risk"]["stop_loss_pct"] == CFG["risk"]["stop_loss_pct"], \
+assert _strict["risk"]["stop_loss_pct"] == _balanced["risk"]["stop_loss_pct"], \
     "профиль затёр значения, которых в нём не было"
-print("   strict ужесточает пороги и не трогает остальное")
+print("   strict ужесточает отбор и не трогает остальное")
+
+# Гейт живёт в risk и от профиля не зависит: строгость отбора и реакция на
+# низкий winrate — разные решения, и склеивать их было ошибкой.
+assert _strict["risk"]["gate_mode"] == _balanced["risk"]["gate_mode"], \
+    "профиль вмешался в настройку гейта"
+print("   профиль не трогает гейт — это отдельная настройка")
 
 try:
     load_config(_cfg_with("такого-нет"))

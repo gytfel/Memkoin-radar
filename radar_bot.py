@@ -624,7 +624,7 @@ class Radar:
             f"от {rk['account_size_sol']:g} SOL\n"
             f"гейт: {esc(rk['gate_mode'])}, цель {rk['target_hit_rate']*100:.0f}%\n\n"
             "Правятся в config.yaml, после правки нужен перезапуск.\n"
-            "Строже — profile: strict в начале файла.", chat)
+            "Профиль — ключ profile в начале файла: balanced | strict.", chat)
 
     async def cmd_pause(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         self.muted = True
