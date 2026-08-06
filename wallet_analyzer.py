@@ -100,6 +100,36 @@ def load_dotenv(path: str) -> None:
             os.environ[key] = value
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Накладываем профиль на базовые значения, не теряя незаданные ключи."""
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def apply_profile(cfg: dict, path: str = "config.yaml") -> dict:
+    """Профиль — набор порогов «строгий/обычный» поверх базовых.
+
+    Смысл в том, что строгость это один осознанный выбор, а не десяток
+    разрозненных чисел: править их по одному — верный способ получить
+    несогласованный конфиг вроде «трое кошельков, но ликвидность 15k».
+    """
+    profiles = cfg.pop("profiles", None) or {}
+    name = str(cfg.get("profile") or "").strip()
+    if not name:
+        return cfg
+    if name not in profiles:
+        raise SystemExit(f"{path}: профиль {name!r} не описан. "
+                         f"Доступны: {', '.join(profiles) or '—'}")
+    over = profiles[name]
+    if not isinstance(over, dict):
+        raise SystemExit(f"{path}: профиль {name!r} должен быть словарём")
+    return _deep_merge(cfg, over)
+
+
 def load_config(path: str = "config.yaml") -> dict:
     # .env ищем и рядом с конфигом, и в рабочем каталоге: конфиг могут вынести
     # в /etc или передать через --config, а ключи оставить там, откуда
@@ -114,7 +144,7 @@ def load_config(path: str = "config.yaml") -> dict:
     cfg = yaml.safe_load(raw)
     if not isinstance(cfg, dict):
         raise SystemExit(f"{path}: ожидался YAML-словарь, получено {type(cfg).__name__}")
-    return cfg
+    return apply_profile(cfg, path)
 
 
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -148,6 +178,29 @@ def require_config(cfg: dict, *dotted_paths: str) -> None:
             problems.append(f"{path}: переменная окружения {var} не установлена")
     if problems:
         raise SystemExit("Конфиг не готов:\n  " + "\n  ".join(problems) + "\n" + ENV_HINT)
+
+
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def is_solana_address(value: str) -> bool:
+    """Адрес Solana — ровно 32 байта в base58.
+
+    Проверка нужна на входе от человека: опечатка в адресе не даёт ошибки,
+    Helius на неё просто отвечает пустым списком. Кошелёк молча не следится,
+    и понять это можно только по отсутствию сигналов.
+    """
+    if not 32 <= len(value) <= 44:
+        return False
+    num = 0
+    for ch in value:
+        idx = B58_ALPHABET.find(ch)
+        if idx < 0:
+            return False
+        num = num * 58 + idx
+    body = num.to_bytes((num.bit_length() + 7) // 8, "big")
+    pad = len(value) - len(value.lstrip("1"))
+    return len(body) + pad == 32
 
 
 def _safe_proxy(proxy: str) -> str:

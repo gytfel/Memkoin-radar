@@ -258,7 +258,7 @@ assert "Открытых" in _ask("/open@my_bot")[0], "имя бота в ком
 print("   /open@my_bot распознаётся как /open")
 
 
-async def _boom(session, tg, chat):
+async def _boom(session, tg, chat, arg=""):
     raise RuntimeError("тестовый сбой")
 
 
@@ -272,6 +272,50 @@ assert _bot.muted and "resume" in _ask("/status")[0], "пауза не видн�
 _bot.muted = False
 print("   /pause виден в /status и снимается через /resume")
 
+assert "не похож на адрес Solana" in _ask("/addwallet 6S8GezПЛОХОЙ")[0]
+print("   /addwallet отбивает адрес с опечаткой")
+
 _journal.close()
+
+# --- 9. профили отбора ------------------------------------------------------ #
+print(f"\n{'='*74}\nПрофили\n{'-'*74}")
+
+_cfg_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+with open(_cfg_path, encoding="utf-8") as _f:
+    _raw = _f.read()
+_tmp = tempfile.mkdtemp()
+
+
+def _cfg_with(profile: str) -> str:
+    dst = os.path.join(_tmp, f"{profile}.yaml")
+    with open(dst, "w", encoding="utf-8") as f:
+        f.write(_raw.replace("profile: balanced", f"profile: {profile}"))
+    return dst
+
+
+_strict = load_config(_cfg_with("strict"))
+assert _strict["radar"]["confluence_wallets"] == 3, "профиль не наложился"
+assert _strict["risk"]["gate_mode"] == "hard", "strict не включил жёсткий гейт"
+# ключ, которого в профиле нет, должен уцелеть — иначе merge затирает базу
+assert _strict["risk"]["stop_loss_pct"] == CFG["risk"]["stop_loss_pct"], \
+    "профиль затёр значения, которых в нём не было"
+print("   strict ужесточает пороги и не трогает остальное")
+
+try:
+    load_config(_cfg_with("такого-нет"))
+except SystemExit as _e:
+    assert "не описан" in str(_e)
+    print("   несуществующий профиль останавливает запуск с внятной ошибкой")
+else:
+    raise AssertionError("несуществующий профиль проглочен молча")
+
+# winrate — функция расстояния до тейка, а не качества отбора.
+# Проверяем то самое утверждение из README, на котором строится ответ про 80%.
+for _sl, _tp in ((25, 6.25), (25, 40), (25, 100), (40, 10)):
+    _wr = _sl / (_sl + _tp)
+    _ev = _wr * _tp - (1 - _wr) * _sl
+    assert abs(_ev) < 1e-9, f"ожидание не ноль при -{_sl}/+{_tp}: {_ev}"
+print("   при случайной цене любое сочетание стоп/тейк даёт ожидание 0")
+print(f"   в том числе 80% winrate при стопе -25% и тейке +6.25%")
 
 print(f"\n{'='*74}\nВсе проверки логики пройдены.\n{'='*74}")

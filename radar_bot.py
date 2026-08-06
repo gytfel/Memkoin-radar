@@ -34,9 +34,9 @@ import aiohttp
 
 import token_safety as ts
 from signal_journal import SignalJournal
-from wallet_analyzer import (fetch_swaps, get_json, load_config,
-                             make_session, post_json, require_config,
-                             setup_logging)
+from wallet_analyzer import (fetch_swaps, get_json, is_solana_address,
+                             load_config, make_session, post_json,
+                             require_config, setup_logging)
 
 TG = "https://api.telegram.org/bot{token}/{method}"
 TG_LIMIT = 4096          # жёсткий лимит длины сообщения в Telegram
@@ -54,6 +54,8 @@ COMMANDS = [
     ("stats",    "замеренный winrate по условиям",      "Результаты"),
     ("history",  "последние закрытые сигналы",          "Результаты"),
     ("wallets",  "за какими кошельками слежу",          "Настройки"),
+    ("addwallet", "добавить кошелёк: /addwallet адрес", "Настройки"),
+    ("delwallet", "убрать кошелёк: /delwallet адрес",   "Настройки"),
     ("settings", "пороги входа, риска и безопасности",  "Настройки"),
     ("pause",    "перестать присылать сигналы",         "Настройки"),
     ("resume",   "вернуть сигналы",                     "Настройки"),
@@ -159,9 +161,13 @@ class Telegram:
 #  радар
 # --------------------------------------------------------------------------- #
 class Radar:
-    def __init__(self, cfg: dict, wallets: list[str], journal: SignalJournal):
+    def __init__(self, cfg: dict, wallets: list[str], journal: SignalJournal,
+                 wallets_path: str | None = None):
         self.cfg = cfg
         self.wallets = wallets
+        # Путь нужен, чтобы /addwallet пережил перезапуск: правка только в
+        # памяти выглядит как работающая, а после рестарта кошелёк исчезает.
+        self.wallets_path = wallets_path
         self.j = journal
         # mint -> deque[(ts, wallet, sol)]. Обычный dict, а не defaultdict:
         # чтение конфлюэнса не должно само плодить пустые ключи.
@@ -375,6 +381,8 @@ class Radar:
             "watch": self.cmd_watch, "stats": self.cmd_stats,
             "history": self.cmd_history, "wallets": self.cmd_wallets,
             "settings": self.cmd_settings,
+            "addwallet": self.cmd_addwallet,
+            "delwallet": self.cmd_delwallet,
             "pause": self.cmd_pause, "resume": self.cmd_resume,
         }
         for u in await tg.poll():
@@ -392,13 +400,14 @@ class Radar:
 
             # "/open@my_bot что-то" -> "open". В группах Telegram сам дописывает
             # имя бота, и сравнение по целой строке такую команду не узнавало.
-            cmd = text.split()[0][1:].split("@")[0].lower()
+            head, _, arg = text.partition(" ")
+            cmd = head[1:].split("@")[0].lower()
             handler = router.get(cmd)
             if handler is None:
                 await tg.send(f"Не знаю команду /{esc(cmd)}.\n\n" + help_text(), chat)
                 continue
             try:
-                await handler(session, tg, chat)
+                await handler(session, tg, chat, arg)
             except asyncio.CancelledError:
                 raise
             except Exception as e:                              # noqa: BLE001
@@ -410,7 +419,7 @@ class Radar:
                               f"{esc(type(e).__name__)}. Подробности в логе.", chat)
 
     # ---- справка ---------------------------------------------------- #
-    async def cmd_start(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_start(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         r = self.cfg["radar"]
         await tg.send(
             "🛰 <b>Memkoin Radar</b>\n\n"
@@ -422,11 +431,11 @@ class Radar:
             "сигнал приходит <i>после</i> того, как они зашли. Решение за тобой.\n\n"
             + help_text(), chat)
 
-    async def cmd_help(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_help(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         await tg.send(help_text(), chat)
 
     # ---- что происходит --------------------------------------------- #
-    async def cmd_status(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_status(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         up = (time.time() - self.started) / 3600
         wr, n = self.j.hit_rate()
         rk = self.cfg["risk"]
@@ -443,7 +452,7 @@ class Radar:
             f"Сигналы: <b>{'приглушены — /resume' if self.muted else 'включены'}</b>",
             chat)
 
-    async def cmd_open(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_open(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         rows = self.j.list_open()
         if not rows:
             await tg.send("Открытых сигналов нет.", chat)
@@ -465,7 +474,7 @@ class Radar:
             lines.append(f"\n…и ещё {len(rows) - OPEN_LIMIT}")
         await tg.send("\n".join(lines), chat)
 
-    async def cmd_watch(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_watch(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         """Что набирает конфлюэнс, но сигналом ещё не стало.
 
         Самая частая претензия к такому боту — «он молчит, он сломан».
@@ -496,11 +505,11 @@ class Radar:
         await tg.send("\n".join(lines), chat)
 
     # ---- результаты -------------------------------------------------- #
-    async def cmd_stats(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_stats(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         await tg.send("📊 <b>Замеренная статистика</b>\n<pre>"
                       + esc(self.j.summary()) + "</pre>", chat)
 
-    async def cmd_history(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_history(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         rows = self.j.list_closed(HISTORY_LIMIT)
         if not rows:
             await tg.send("Закрытых сигналов пока нет.", chat)
@@ -517,18 +526,89 @@ class Radar:
         await tg.send("\n".join(lines), chat)
 
     # ---- настройки ---------------------------------------------------- #
-    async def cmd_wallets(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_wallets(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         lines = [f"👛 <b>Отслеживаю {len(self.wallets)} кошельков</b>\n"]
         lines += [f"<code>{esc(w)}</code>" for w in self.wallets[:WALLET_LIMIT]]
         if len(self.wallets) > WALLET_LIMIT:
             lines.append(f"…и ещё {len(self.wallets) - WALLET_LIMIT}")
         await tg.send("\n".join(lines), chat)
 
-    async def cmd_settings(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_addwallet(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
+        addr = arg.strip().split()[0] if arg.strip() else ""
+        if not addr:
+            await tg.send("Нужен адрес: <code>/addwallet 6S8Gez…ajKC</code>", chat)
+            return
+        if not is_solana_address(addr):
+            # Опечатку Helius не считает ошибкой — просто вернёт пустой список.
+            # Кошелёк молча не следился бы, и понять это было бы нельзя.
+            await tg.send(f"<code>{esc(addr)}</code> не похож на адрес Solana "
+                          f"(нужны 32 байта в base58). Проверь, не потерялся ли символ.",
+                          chat)
+            return
+        if addr in self.wallets:
+            await tg.send("Такой кошелёк уже отслеживается.", chat)
+            return
+
+        ok, note = self._persist_wallet(addr, add=True)
+        if not ok:
+            await tg.send(note, chat)
+            return
+        self.wallets.append(addr)
+        await tg.send(f"✅ Добавлен.\n<code>{esc(addr)}</code>\n"
+                      f"Теперь отслеживаю <b>{len(self.wallets)}</b>.\n\n{note}", chat)
+
+    async def cmd_delwallet(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
+        addr = arg.strip().split()[0] if arg.strip() else ""
+        if not addr:
+            await tg.send("Нужен адрес: <code>/delwallet 6S8Gez…ajKC</code>\n"
+                          "Список — /wallets", chat)
+            return
+        if addr not in self.wallets:
+            await tg.send("Такого кошелька в списке нет. Проверь /wallets", chat)
+            return
+
+        ok, note = self._persist_wallet(addr, add=False)
+        if not ok:
+            await tg.send(note, chat)
+            return
+        self.wallets.remove(addr)
+        await tg.send(f"🗑 Убран.\n<code>{esc(addr)}</code>\n"
+                      f"Осталось <b>{len(self.wallets)}</b>.\n\n{note}", chat)
+
+    def _persist_wallet(self, addr: str, add: bool) -> tuple[bool, str]:
+        """Правим файл со списком. Возвращаем (получилось, что сказать человеку)."""
+        path = self.wallets_path
+        if not path:
+            return True, "⚠️ Только до перезапуска: файл со списком неизвестен."
+        if path.endswith(".json"):
+            # qualified.json собирает анализатор, руками его править бессмысленно:
+            # следующий прогон wallet_analyzer всё перезапишет.
+            return False, ("Список собран анализатором в qualified.json — "
+                           "правка вручную пропадёт при следующем прогоне.\n"
+                           "Добавляй адреса в wallets.txt и запускай "
+                           "wallet_analyzer.py.")
+        try:
+            if add:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"{addr}\n")
+            else:
+                with open(path, encoding="utf-8") as f:
+                    lines = f.readlines()
+                with open(path, "w", encoding="utf-8") as f:
+                    # сверяем адрес до комментария: discover.py пишет
+                    # "<адрес>  # ранних входов: N", и строка не равна адресу
+                    f.writelines(ln for ln in lines
+                                 if ln.split("#", 1)[0].strip() != addr)
+        except OSError as e:
+            return False, f"Не смог записать {esc(path)}: {esc(e)}"
+        return True, f"Записано в {esc(path)} — переживёт перезапуск."
+
+    async def cmd_settings(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         r, s, rk = self.cfg["radar"], self.cfg["safety"], self.cfg["risk"]
         ladder = " / ".join(f"+{p:g}%" for p in rk["take_profit_ladder_pct"])
         await tg.send(
-            "⚙️ <b>Текущие пороги</b>\n\n"
+            f"⚙️ <b>Текущие пороги</b> · профиль "
+            f"<b>{esc(self.cfg.get('profile') or 'без профиля')}</b>\n\n"
             "<b>Условие сигнала</b>\n"
             f"кошельков: {r['confluence_wallets']}+ за {r['confluence_window_min']} мин\n"
             f"объём покупок: {r['min_combined_buy_sol']}+ SOL\n"
@@ -541,25 +621,28 @@ class Radar:
             f"стоп: −{rk['stop_loss_pct']:g}%\n"
             f"тейки: {ladder}\n"
             f"риск на сделку: {rk['risk_per_trade_pct']:g}% "
-            f"от {rk['account_size_sol']:g} SOL\n\n"
-            "Правятся в config.yaml, после правки нужен перезапуск.", chat)
+            f"от {rk['account_size_sol']:g} SOL\n"
+            f"гейт: {esc(rk['gate_mode'])}, цель {rk['target_hit_rate']*100:.0f}%\n\n"
+            "Правятся в config.yaml, после правки нужен перезапуск.\n"
+            "Строже — profile: strict в начале файла.", chat)
 
-    async def cmd_pause(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_pause(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         self.muted = True
         await tg.send("🔇 Сигналы приглушены.\n\n"
                       "Радар продолжает работать и писать сигналы в журнал — "
                       "замер winrate не прервётся, вы просто их не увидите.\n"
                       "Вернуть: /resume", chat)
 
-    async def cmd_resume(self, session, tg: Telegram, chat: str) -> None:
+    async def cmd_resume(self, session, tg: Telegram, chat: str, arg: str = "") -> None:
         self.muted = False
         await tg.send("🔔 Сигналы снова приходят.", chat)
 
 
 # --------------------------------------------------------------------------- #
-async def main_loop(cfg: dict, wallets: list[str], db: str):
+async def main_loop(cfg: dict, wallets: list[str], db: str,
+                    wallets_path: str | None = None):
     journal = SignalJournal(db)
-    radar = Radar(cfg, wallets, journal)
+    radar = Radar(cfg, wallets, journal, wallets_path)
     tick = 0
 
     try:
@@ -662,7 +745,7 @@ def main() -> None:
         raise SystemExit(1) from e
 
     try:
-        asyncio.run(main_loop(conf, ws, args.db))
+        asyncio.run(main_loop(conf, ws, args.db, args.wallets))
     except KeyboardInterrupt:
         log.info("Остановлено вручную.")
 
